@@ -617,7 +617,69 @@ void SaveData() {
         logger::info("Data saved to {}", finalPath);
     }
 
-    UpdateLastSavedState(); // Confirma que o estado atual agora é o ficheiro guardado
+    if (isEditingPreset && !activePresetName.empty()) {
+        if (std::filesystem::exists(NPCPath)) {
+            for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
+                if (entry.path().extension() == ".json") {
+                    FILE* nFp = nullptr;
+                    fopen_s(&nFp, entry.path().string().c_str(), "rb");
+                    if (nFp) {
+                        char readBuffer[2048];
+                        rapidjson::FileReadStream is(nFp, readBuffer, sizeof(readBuffer));
+                        rapidjson::Document npcDoc;
+                        npcDoc.ParseStream(is);
+                        fclose(nFp);
+
+                        // Checa se este NPC está atrelado ao preset que acabamos de salvar
+                        if (npcDoc.IsObject() && npcDoc.HasMember("preset") && npcDoc["preset"].IsString()) {
+                            if (npcDoc["preset"].GetString() == activePresetName) {
+
+                                std::string filename = entry.path().stem().string();
+                                RE::TESNPC* targetNPC = nullptr;
+
+                                // Tenta achar o NPC pelo EditorID ou FormID
+                                if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
+                                    targetNPC = edidForm->As<RE::TESNPC>();
+                                }
+                                else {
+                                    try {
+                                        RE::FormID id = std::stoul(filename, nullptr, 16);
+                                        if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
+                                    }
+                                    catch (...) {}
+                                }
+
+                                // Se achou o NPC na memória do jogo, aplica os dados novos do preset ('doc') nele
+                                if (targetNPC) {
+                                    Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
+                                    logger::info("Updated NPC base {} with modified preset '{}'", filename, activePresetName);
+
+                                    auto processLists = RE::ProcessLists::GetSingleton();
+                                    if (processLists) {
+                                        for (auto& actorHandle : processLists->highActorHandles) {
+                                            auto ref = actorHandle.get();
+                                            if (ref) {
+                                                if (auto actor = ref->As<RE::Actor>()) {
+                                                    if (!actor->IsPlayerRef() && actor->GetActorBase() == targetNPC) {
+                                                        actor->UpdateSkinColor();
+                                                        actor->UpdateHairColor();
+                                                        actor->Update3DModel();
+                                                        actor->DoReset3D(true);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    UpdateLastSavedState();
 }
 
 void ApplyNPC(bool force3DReset = true) {
