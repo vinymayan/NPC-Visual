@@ -528,8 +528,29 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
 
     ui_headParts.clear();
 
+    //Mapeia todas as "Extra Parts" que pertencem a alguma peça principal que o NPC tem equipada.
+    std::set<RE::BGSHeadPart*> ownedExtraParts;
+    if (g_currentNPC->headParts) {
+        for (int i = 0; i < g_currentNPC->numHeadParts; i++) {
+            auto hp = g_currentNPC->headParts[i];
+            if (hp) {
+                for (auto* extra : hp->extraParts) {
+                    if (extra) ownedExtraParts.insert(extra);
+                }
+            }
+        }
+    }
+
+    // Adiciona à UI apenas as peças que NÃO são "filhas" de outra peça já equipada.
     for (int i = 0; i < g_currentNPC->numHeadParts; i++) {
-        if (g_currentNPC->headParts && g_currentNPC->headParts[i]) ui_headParts.push_back(g_currentNPC->headParts[i]);
+        if (g_currentNPC->headParts && g_currentNPC->headParts[i]) {
+            auto hp = g_currentNPC->headParts[i];
+
+            // Se esta headpart NÃO estiver na lista de filhas ownedExtraParts, mostramos na UI.
+            if (ownedExtraParts.find(hp) == ownedExtraParts.end()) {
+                ui_headParts.push_back(hp);
+            }
+        }
     }
 
     ui_tintLayers.clear();
@@ -630,14 +651,12 @@ void SaveData() {
                         npcDoc.ParseStream(is);
                         fclose(nFp);
 
-                        // Checa se este NPC está atrelado ao preset que acabamos de salvar
                         if (npcDoc.IsObject() && npcDoc.HasMember("preset") && npcDoc["preset"].IsString()) {
                             if (npcDoc["preset"].GetString() == activePresetName) {
 
                                 std::string filename = entry.path().stem().string();
                                 RE::TESNPC* targetNPC = nullptr;
 
-                                // Tenta achar o NPC pelo EditorID ou FormID
                                 if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
                                     targetNPC = edidForm->As<RE::TESNPC>();
                                 }
@@ -649,10 +668,17 @@ void SaveData() {
                                     catch (...) {}
                                 }
 
-                                // Se achou o NPC na memória do jogo, aplica os dados novos do preset ('doc') nele
                                 if (targetNPC) {
                                     Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
                                     logger::info("Updated NPC base {} with modified preset '{}'", filename, activePresetName);
+
+
+                                    auto faceGenManager = RE::BSFaceGenManager::GetSingleton();
+                                    if (faceGenManager) {
+                                        faceGenManager->modelMap.lock.LockForWrite();
+                                        faceGenManager->modelMap.map.clear();
+                                        faceGenManager->modelMap.lock.UnlockForWrite();
+                                    }
 
                                     auto processLists = RE::ProcessLists::GetSingleton();
                                     if (processLists) {
@@ -661,9 +687,6 @@ void SaveData() {
                                             if (ref) {
                                                 if (auto actor = ref->As<RE::Actor>()) {
                                                     if (!actor->IsPlayerRef() && actor->GetActorBase() == targetNPC) {
-                                                        actor->UpdateSkinColor();
-                                                        actor->UpdateHairColor();
-                                                        actor->Update3DModel();
                                                         actor->DoReset3D(true);
                                                     }
                                                 }
@@ -687,7 +710,6 @@ void ApplyNPC(bool force3DReset = true) {
     rapidjson::Document doc;
 
     if (!ui_linkedPreset.empty()) {
-        // Se usar Preset, aplica os dados do Preset
         std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
         FILE* fp = nullptr;
         fopen_s(&fp, pPath.c_str(), "rb");
@@ -704,11 +726,32 @@ void ApplyNPC(bool force3DReset = true) {
 
     Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
 
-    if (g_currentActor && force3DReset) {
-        g_currentActor->UpdateSkinColor();
-        g_currentActor->UpdateHairColor();
-        g_currentActor->Update3DModel();
-        g_currentActor->DoReset3D(true);
+    if (force3DReset) {
+
+        auto faceGenManager = RE::BSFaceGenManager::GetSingleton();
+        if (faceGenManager) {
+            faceGenManager->modelMap.lock.LockForWrite();
+            faceGenManager->modelMap.map.clear();
+            faceGenManager->modelMap.lock.UnlockForWrite();
+        }
+
+        if (g_currentActor) {
+            g_currentActor->DoReset3D(true);
+        }
+
+        auto processLists = RE::ProcessLists::GetSingleton();
+        if (processLists) {
+            for (auto& actorHandle : processLists->highActorHandles) {
+                auto ref = actorHandle.get();
+                if (ref) {
+                    if (auto actor = ref->As<RE::Actor>()) {
+                        if (!actor->IsPlayerRef() && actor != g_currentActor && actor->GetActorBase() == g_currentNPC) {
+                            actor->DoReset3D(true);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -742,7 +785,10 @@ void DrawMainEditorUI() {
     std::map<RE::BGSHeadPart::HeadPartType, int> hpCounts;
     for (auto hp : ui_headParts) {
         if (!hp) continue;
-        hpCounts[hp->type.get()]++;
+        if (!hp->flags.all(RE::BGSHeadPart::Flag::kIsExtraPart)) {
+            hpCounts[hp->type.get()]++;
+        }
+
         if (!IsHeadPartValid(hp, ui_race, ui_isFemale)) {
             hasErrors = true;
             errorMsgs += std::format("- Incompatible part detected: {}\n", clib_util::editorID::get_editorID(hp));
@@ -751,7 +797,7 @@ void DrawMainEditorUI() {
     for (auto& pair : hpCounts) {
         if (pair.second > 1 && pair.first != RE::BGSHeadPart::HeadPartType::kMisc && pair.first != RE::BGSHeadPart::HeadPartType::kScar) {
             hasErrors = true;
-            errorMsgs += "- Multiple HeadParts of the same unique type found!\n";
+            errorMsgs += "- Multiple BASE HeadParts of the same unique type found!\n";
             break;
         }
     }

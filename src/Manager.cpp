@@ -58,6 +58,8 @@ namespace FormUtil {
 void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Document& doc) {
     if (!npc) return;
 
+    npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kIsChargenFacePreset);
+
     // 1. Atributos Básicos
     if (doc.HasMember("height") && doc["height"].IsFloat()) {
         npc->height = doc["height"].GetFloat();
@@ -132,23 +134,33 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Do
         }
     }
 
-    // 3. HeadParts (Substituição de Array Dinâmico)
+    // 3. HeadParts (Substituição de Array Dinâmico com Extra Parts)
     if (doc.HasMember("headParts") && doc["headParts"].IsArray()) {
         std::vector<RE::BGSHeadPart*> parts;
+        std::function<void(RE::BGSHeadPart*)> AddPartAndExtras = [&](RE::BGSHeadPart* hp) {
+            if (!hp) return;
+            if (std::find(parts.begin(), parts.end(), hp) == parts.end()) {
+                parts.push_back(hp);
+                for (auto* extra : hp->extraParts) {
+                    AddPartAndExtras(extra);
+                }
+            }
+            };
+
+
         for (auto& hpJson : doc["headParts"].GetArray()) {
             if (auto hp = RE::TESForm::LookupByID<RE::BGSHeadPart>(FormUtil::FormIDFromString(hpJson.GetString()))) {
-                parts.push_back(hp);
+                AddPartAndExtras(hp);
             }
         }
 
-        // Libera a memória anterior para forçar a reaplicação e evitar memory leaks
         if (npc->headParts) {
             RE::free(npc->headParts);
             npc->headParts = nullptr;
         }
+        npc->numHeadParts = 0; 
 
         if (!parts.empty()) {
-            // Aloca e força a reaplicação de todas as headparts vindas do JSON
             auto newHeadParts = RE::calloc<RE::BGSHeadPart*>(parts.size());
             for (size_t i = 0; i < parts.size(); ++i) {
                 newHeadParts[i] = parts[i];
@@ -156,12 +168,8 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Do
             npc->headParts = newHeadParts;
             npc->numHeadParts = static_cast<int8_t>(parts.size());
         }
-        else {
-            npc->numHeadParts = 0;
-        }
     }
     else {
-        // Garante que, mesmo sem alterações no JSON, as headparts atuais sejam recarregadas/reaplicadas
         if (npc->headParts && npc->numHeadParts > 0) {
             std::vector<RE::BGSHeadPart*> currentParts;
             for (int i = 0; i < npc->numHeadParts; ++i) {
