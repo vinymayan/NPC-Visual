@@ -1,11 +1,15 @@
-#include "logger.h"
+﻿#include "logger.h"
+#include "Settings.h"
+#include "Manager.h"
+
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
     if (message->type == SKSE::MessagingInterface::kDataLoaded) {
-        // Start
+        Manager::GetSingleton()->PopulateAllLists();
+        NSettings::MmRegister();
+        NSettings::Load();
     }
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
-        // Post-load
     }
 }
 
