@@ -6,6 +6,9 @@
 #include <functional>
 #include "ClibUtil/editorID.hpp"
 #include "rapidjson/document.h"
+#include "BSFaceGenBaseMorphExtraData.h"
+#include <thread>
+#include <chrono>
 
 namespace FormUtil {
     const RE::TESFile* GetMasterFile(RE::TESForm* ref);
@@ -40,6 +43,10 @@ public:
         return &singleton;
     }
 
+    void RegisterAffectedNPC(RE::FormID baseID, const std::string& nifPath);
+    void UnregisterAffectedNPC(RE::FormID baseID);
+    bool IsNPCAffected(RE::FormID baseID, std::string& outNifPath);
+
     void PopulateAllLists();
     static std::string ToUTF8(std::string_view a_str);
     // Data Store: Map of "TypeName" -> List of InternalFormInfo
@@ -49,6 +56,10 @@ public:
     // Register callback for when population is done
     void RegisterReadyCallback(std::function<void()> callback);
     static void ApplyNPCCustomizationFromJSON(RE::TESNPC* a_npc, const rapidjson::Document& doc);
+    static RE::NiPointer<RE::NiAVObject> LoadNifFromFile(const std::string& a_path);
+    static void DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifPath);
+    static void ScheduleFaceDeform(RE::FormID actorID, const std::string& nifPath, int retries = 40);
+    static RE::BGSHeadPart* ExtractHeadPartFromNif(const std::string& a_nifPath);
 
 private:
     Manager() = default;
@@ -59,5 +70,6 @@ private:
     bool _isPopulated = false;
     std::map<std::string, std::vector<InternalFormInfo>> _dataStore;
     std::vector<std::function<void()>> _readyCallbacks;
+    std::map<RE::FormID, std::string> _affectedNPCs;
 };
 

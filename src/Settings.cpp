@@ -57,6 +57,85 @@ static std::vector<UITintLayer> ui_tintLayers;
 static std::string ui_linkedPreset = "";
 static std::vector<std::string> ui_availablePresets;
 static rapidjson::Document originalEngineState;
+static std::map<RE::FormID, std::string> g_vanillaNPCStates;
+
+void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
+    rapidjson::Document doc;
+    auto& allocator = doc.GetAllocator();
+    doc.SetObject();
+
+    doc.AddMember("height", npc->height, allocator);
+    doc.AddMember("isFemale", npc->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kFemale), allocator);
+    doc.AddMember("oppositeGenderAnim", npc->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims), allocator);
+
+    rapidjson::Value bodyTint(rapidjson::kObjectType);
+    bodyTint.AddMember("r", npc->bodyTintColor.red, allocator);
+    bodyTint.AddMember("g", npc->bodyTintColor.green, allocator);
+    bodyTint.AddMember("b", npc->bodyTintColor.blue, allocator);
+    bodyTint.AddMember("a", npc->bodyTintColor.alpha, allocator);
+    doc.AddMember("bodyTintColor", bodyTint, allocator);
+
+    if (npc->race) doc.AddMember("race", rapidjson::Value(FormUtil::NormalizeFormID(npc->race).c_str(), allocator), allocator);
+    if (npc->farSkin) doc.AddMember("skin", rapidjson::Value(FormUtil::NormalizeFormID(npc->farSkin).c_str(), allocator), allocator);
+    if (npc->defaultOutfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->defaultOutfit).c_str(), allocator), allocator);
+    if (npc->sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->sleepOutfit).c_str(), allocator), allocator);
+    if (npc->headRelatedData && npc->headRelatedData->hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(npc->headRelatedData->hairColor).c_str(), allocator), allocator);
+
+    rapidjson::Value hpArray(rapidjson::kArrayType);
+    std::set<RE::BGSHeadPart*> ownedExtraParts;
+    if (npc->headParts) {
+        for (int i = 0; i < npc->numHeadParts; i++) {
+            auto hp = npc->headParts[i];
+            if (hp) {
+                for (auto* extra : hp->extraParts) {
+                    if (extra) ownedExtraParts.insert(extra);
+                }
+            }
+        }
+    }
+    for (int i = 0; i < npc->numHeadParts; i++) {
+        if (npc->headParts && npc->headParts[i]) {
+            auto hp = npc->headParts[i];
+            if (ownedExtraParts.find(hp) == ownedExtraParts.end()) {
+                std::string hpStr = FormUtil::NormalizeFormID(hp);
+                hpArray.PushBack(rapidjson::Value(hpStr.c_str(), allocator), allocator);
+            }
+        }
+    }
+    doc.AddMember("headParts", hpArray, allocator);
+
+    rapidjson::Value tintArray(rapidjson::kArrayType);
+    if (npc->tintLayers) {
+        for (std::uint32_t i = 0; i < npc->tintLayers->size(); ++i) {
+            auto layer = (*npc->tintLayers)[i];
+            if (layer) {
+                rapidjson::Value tlVal(rapidjson::kObjectType);
+                tlVal.AddMember("index", layer->tintIndex, allocator);
+                rapidjson::Value cVal(rapidjson::kObjectType);
+                cVal.AddMember("r", layer->tintColor.red, allocator);
+                cVal.AddMember("g", layer->tintColor.green, allocator);
+                cVal.AddMember("b", layer->tintColor.blue, allocator);
+                cVal.AddMember("a", layer->tintColor.alpha, allocator);
+                tlVal.AddMember("color", cVal, allocator);
+                tlVal.AddMember("interpolation", layer->interpolationValue / 100.0f, allocator);
+                tlVal.AddMember("preset", layer->preset, allocator);
+                tintArray.PushBack(tlVal, allocator);
+            }
+        }
+    }
+    doc.AddMember("tintLayers", tintArray, allocator);
+
+    rapidjson::Value morphsArray(rapidjson::kArrayType);
+    if (npc->faceData) {
+        for (int i = 0; i < 19; i++) morphsArray.PushBack(npc->faceData->morphs[i], allocator);
+    }
+    doc.AddMember("faceMorphs", morphsArray, allocator);
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    outJson = buffer.GetString();
+}
 
 // ==========================================
 // CONTROLADOR DE ALTERAÇÕES NÃO GUARDADAS
@@ -64,6 +143,7 @@ static rapidjson::Document originalEngineState;
 static std::string g_lastSavedStateStr = "";
 static std::string g_lastSavedPresetLink = "";
 
+static std::string ui_customFaceNif = "";
 
 // ==========================================
 // FUNÇÕES DE EXPORTAÇÃO ZIP (MINIZ)
@@ -155,17 +235,59 @@ void ExportNPCAsZip(RE::TESNPC* npc, const std::string& linkedPreset) {
 bool IsHeadPartValid(RE::BGSHeadPart* hp, RE::TESRace* race, bool isFemale) {
     if (!hp) return true;
 
-    // Checa o Sexo
+    // 1. Checa o Sexo
     bool hpFemale = hp->flags.all(RE::BGSHeadPart::Flag::kFemale);
     bool hpMale = hp->flags.all(RE::BGSHeadPart::Flag::kMale);
     if (isFemale && hpMale && !hpFemale) return false;
     if (!isFemale && hpFemale && !hpMale) return false;
 
-    // Checa a Raça
-    if (race && hp->validRaces) {
-        if (!hp->validRaces->HasForm(race)) return false;
+    // 2. Checa a Raça
+    if (race) {
+        // Se a propriedade validRaces for nula, a peça é válida para todas as raças.
+        if (!hp->validRaces) {
+            return true;
+        }
+
+        // Verifica se a raça do NPC está explicitamente na lista
+        if (hp->validRaces->HasForm(race)) {
+            return true;
+        }
+
+        // FALLBACK: Raças derivadas (ex: Vampiros)
+        // O Skyrim usa a armorParentRace (ex: NordRaceVampire -> NordRace) para herdar HeadParts.
+        if (race->armorParentRace && hp->validRaces->HasForm(race->armorParentRace)) {
+            return true;
+        }
+
+        // EXCEÇÃO: Se a lista existe, mas o criador do mod deixou ela vazia.
+        // Assumimos que a intenção era ser válida para todas as raças.
+        if (hp->validRaces->forms.empty()) {
+            return true;
+        }
+
+        // Se chegou aqui, a raça (ou a raça base) realmente não tem permissão para usar esta peça.
+        return false;
     }
+
     return true;
+}
+
+// Função auxiliar para listar as raças permitidas de uma HeadPart em formato de texto
+std::string GetValidRacesString(RE::BGSHeadPart* hp) {
+    if (!hp || !hp->validRaces || hp->validRaces->forms.empty()) return "Any";
+
+    std::string races = "";
+    for (auto form : hp->validRaces->forms) {
+        if (form) {
+            std::string edid = clib_util::editorID::get_editorID(form);
+            if (edid.empty()) edid = std::format("{:08X}", form->GetFormID());
+            races += edid + ", ";
+        }
+    }
+    if (!races.empty()) {
+        races.pop_back(); races.pop_back(); // Remove a última vírgula e espaço
+    }
+    return races;
 }
 
 // Função Auxiliar para descobrir o que o Index do Tint significa baseado na Raça e Sexo
@@ -224,13 +346,36 @@ std::vector<AvailableTint> GetAvailableTints(RE::TESRace* race, bool isFemale) {
     return result;
 }
 
-// Retorna os Presets disponíveis na pasta
+struct CustomPresetInfo {
+    std::string name;
+    void* textureID;
+};
+static std::vector<CustomPresetInfo> scannedPresets;
+static bool openPresetSelectModal = false;
+
 void RefreshAvailablePresets() {
+    scannedPresets.clear();
     ui_availablePresets.clear();
     std::filesystem::create_directories(PresetsPath);
+
     for (const auto& entry : std::filesystem::directory_iterator(PresetsPath)) {
         if (entry.path().extension() == ".json") {
-            ui_availablePresets.push_back(entry.path().stem().string());
+            CustomPresetInfo info;
+            info.name = entry.path().stem().string();
+            ui_availablePresets.push_back(info.name); // Mantém compatibilidade com funções antigas
+
+            std::filesystem::path pngPath = entry.path();
+            pngPath.replace_extension(".png");
+
+            // Verifica e carrega a imagem do preset se existir
+            if (std::filesystem::exists(pngPath)) {
+                info.textureID = SKSEMenuFramework::LoadTexture(pngPath.string());
+            }
+            else {
+                info.textureID = nullptr;
+            }
+
+            scannedPresets.push_back(info);
         }
     }
 }
@@ -255,6 +400,9 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     if (ui_outfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_outfit).c_str(), allocator), allocator);
     if (ui_sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_sleepOutfit).c_str(), allocator), allocator);
     if (ui_hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(ui_hairColor).c_str(), allocator), allocator);
+    if (!ui_customFaceNif.empty()) {
+        doc.AddMember("customFaceNif", rapidjson::Value(ui_customFaceNif.c_str(), allocator), allocator);
+    }
 
     rapidjson::Value hpArray(rapidjson::kArrayType);
     for (auto* hp : ui_headParts) {
@@ -322,7 +470,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     ui_outfit = nullptr;
     ui_sleepOutfit = nullptr;
     ui_hairColor = nullptr;
-
+    ui_customFaceNif = "";
     if (j.HasMember("height") && j["height"].IsFloat()) ui_height = j["height"].GetFloat();
     if (j.HasMember("isFemale") && j["isFemale"].IsBool()) ui_isFemale = j["isFemale"].GetBool();
     if (j.HasMember("oppositeGenderAnim") && j["oppositeGenderAnim"].IsBool()) ui_oppositeGenderAnim = j["oppositeGenderAnim"].GetBool();
@@ -374,6 +522,9 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     else {
         // Inicializa com o valor máximo indicando que está desabilitado
         for (int i = 0; i < 19; i++) ui_morphs[i] = 3.402823466e+38f;
+    }
+    if (j.HasMember("customFaceNif") && j["customFaceNif"].IsString()) {
+        ui_customFaceNif = j["customFaceNif"].GetString();
     }
 }
 
@@ -507,9 +658,16 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
 
     if (!g_currentNPC) return;
 
+    if (!g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
+        std::string vanillaStr;
+        CaptureVanillaState(g_currentNPC, vanillaStr);
+        g_vanillaNPCStates[g_currentNPC->GetFormID()] = vanillaStr;
+    }
+
     isEditingPreset = false;
     activePresetName = "";
     ui_linkedPreset = "";
+    ui_customFaceNif = "";
 
     ui_height = g_currentNPC->height;
     ui_isFemale = g_currentNPC->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kFemale);
@@ -672,14 +830,6 @@ void SaveData() {
                                     Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
                                     logger::info("Updated NPC base {} with modified preset '{}'", filename, activePresetName);
 
-
-                                    auto faceGenManager = RE::BSFaceGenManager::GetSingleton();
-                                    if (faceGenManager) {
-                                        faceGenManager->modelMap.lock.LockForWrite();
-                                        faceGenManager->modelMap.map.clear();
-                                        faceGenManager->modelMap.lock.UnlockForWrite();
-                                    }
-
                                     auto processLists = RE::ProcessLists::GetSingleton();
                                     if (processLists) {
                                         for (auto& actorHandle : processLists->highActorHandles) {
@@ -687,7 +837,9 @@ void SaveData() {
                                             if (ref) {
                                                 if (auto actor = ref->As<RE::Actor>()) {
                                                     if (!actor->IsPlayerRef() && actor->GetActorBase() == targetNPC) {
-                                                        actor->DoReset3D(true);
+                                                        actor->UpdateHairColor();
+                                                        actor->UpdateSkinColor();
+                                                        //actor->DoReset3D(true);
                                                     }
                                                 }
                                             }
@@ -707,6 +859,7 @@ void SaveData() {
 
 void ApplyNPC(bool force3DReset = true) {
     if (!g_currentNPC) return;
+    logger::info("[UI] Botão Apply pressionado para {:08X}", g_currentNPC->GetFormID());
     rapidjson::Document doc;
 
     if (!ui_linkedPreset.empty()) {
@@ -723,20 +876,29 @@ void ApplyNPC(bool force3DReset = true) {
     else {
         GenerateJSONFromUI(doc);
     }
-
+    logger::info("[UI] Chamando Manager::ApplyNPCCustomizationFromJSON...");
     Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
+
+
+    std::string nifToApply = "";
+    if (doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
+        nifToApply = doc["customFaceNif"].GetString();
+    }
+
+    Manager::GetSingleton()->RegisterAffectedNPC(g_currentNPC->GetFormID(), nifToApply);
 
     if (force3DReset) {
 
-        auto faceGenManager = RE::BSFaceGenManager::GetSingleton();
-        if (faceGenManager) {
-            faceGenManager->modelMap.lock.LockForWrite();
-            faceGenManager->modelMap.map.clear();
-            faceGenManager->modelMap.lock.UnlockForWrite();
-        }
-
         if (g_currentActor) {
+            g_currentActor->UpdateHairColor();
+            g_currentActor->UpdateSkinColor();
             g_currentActor->DoReset3D(true);
+
+            // 3. SCHEDULER: Queue deformation 500ms after Reset3D
+            if (!nifToApply.empty()) {
+                logger::info("[UI] Agendando DeformFace para daqui a 500ms...");
+                Manager::ScheduleFaceDeform(g_currentActor->GetFormID(), nifToApply);
+            }
         }
 
         auto processLists = RE::ProcessLists::GetSingleton();
@@ -746,7 +908,14 @@ void ApplyNPC(bool force3DReset = true) {
                 if (ref) {
                     if (auto actor = ref->As<RE::Actor>()) {
                         if (!actor->IsPlayerRef() && actor != g_currentActor && actor->GetActorBase() == g_currentNPC) {
-                            actor->DoReset3D(true);
+                            actor->UpdateHairColor();
+                            actor->UpdateSkinColor();
+                            //actor->DoReset3D(true);
+
+                            // Queue deformation for all instanced actors using this base!
+                            if (!nifToApply.empty()) {
+                                Manager::ScheduleFaceDeform(actor->GetFormID(), nifToApply);
+                            }
                         }
                     }
                 }
@@ -774,6 +943,140 @@ void RevertNPC() {
     }
 }
 
+
+void RestoreDefaultNPC() {
+    if (!g_currentNPC) return;
+
+    // 1. Apaga o ficheiro JSON que define as alterações customizadas deste NPC
+    std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
+    if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
+    std::string filePath = std::format("{}/{}.json", NPCPath, editorID);
+
+    if (std::filesystem::exists(filePath)) {
+        std::filesystem::remove(filePath);
+    }
+
+    ui_linkedPreset = "";
+    ui_customFaceNif = "";
+
+    // 2. Aplica o estado LIMPO E ORIGINAL à memória (Se estiver no Cofre global)
+    if (g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
+        rapidjson::Document doc;
+        doc.Parse(g_vanillaNPCStates[g_currentNPC->GetFormID()].c_str());
+        Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
+    }
+    else {
+        // Fallback de segurança 
+        Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, originalEngineState);
+    }
+
+    // 3. Atualiza a UI para refletir os valores base restaurados
+    LoadNPCToUI(g_currentNPC, g_currentActor);
+    Manager::GetSingleton()->UnregisterAffectedNPC(g_currentNPC->GetFormID());
+    // 4. Dá reset ao modelo 3D do personagem no mapa
+    if (g_currentActor) {
+        g_currentActor->UpdateSkinColor();
+        g_currentActor->UpdateHairColor();
+        g_currentActor->Update3DModel();
+        g_currentActor->DoReset3D(true);
+    }
+    logger::info("Restored {} to absolute default (JSON deleted and Base Form reverted).", editorID);
+}
+
+struct CustomFaceInfo {
+    std::string nifPath;     
+    std::string displayPath; 
+    std::string displayName;
+    RE::FormID originFormID;
+    void* textureID;
+};
+static std::vector<CustomFaceInfo> scannedFaces;
+static bool needFaceScan = true;
+static bool openFaceSelectModal = false;
+
+void ScanFaceGeom() {
+    scannedFaces.clear();
+    std::filesystem::path geomPath = "Data/meshes/actors/character/FaceGenData/FaceGeom";
+    if (!std::filesystem::exists(geomPath)) return;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(geomPath)) {
+        if (entry.path().extension() == ".nif") {
+            CustomFaceInfo info;
+
+            std::string fullPath = entry.path().string();
+            // Substitui barras para garantir que o Find funciona corretamente no Windows
+            std::string normalizedPath = fullPath;
+            std::replace(normalizedPath.begin(), normalizedPath.end(), '/', '\\');
+
+            // 1. Path Relativo para a Game Engine
+            size_t meshPos = normalizedPath.find("meshes\\");
+            if (meshPos != std::string::npos) info.nifPath = normalizedPath.substr(meshPos);
+            else info.nifPath = normalizedPath;
+
+            // 2. Path para a UI (Apenas depois de FaceGeom)
+            size_t faceGeomPos = normalizedPath.find("FaceGeom\\");
+            if (faceGeomPos != std::string::npos) {
+                // +9 salta a palavra "FaceGeom\"
+                info.displayPath = normalizedPath.substr(faceGeomPos + 9);
+            }
+            else {
+                info.displayPath = info.nifPath;
+            }
+
+            // --- LÓGICA DE DETECÇÃO DINÂMICA DE FORMID POR PLUGIN ---
+            std::string stem = entry.path().stem().string(); // Ex: "00123456"
+            std::string pluginFolder = entry.path().parent_path().filename().string(); // Ex: "Skyrim.esm"
+
+            try {
+                // Converte a string hexadecimal do arquivo para FormID numérico
+                uint32_t rawID = std::stoul(stem, nullptr, 16);
+
+                // Remove os bytes de Load Order herdados do CK (mantém apenas o Local ID)
+                uint32_t localID = rawID & 0x00FFFFFF;
+
+                auto dataHandler = RE::TESDataHandler::GetSingleton();
+                info.originFormID = 0;
+
+                // Tenta resolver dinamicamente usando o DataHandler (Funciona para ESP/ESM e ESLs)
+                if (dataHandler) {
+                    info.originFormID = dataHandler->LookupFormID(localID, pluginFolder);
+                }
+
+                // Fallback de segurança (caso seja um arquivo sem o formato pluginFolder correto)
+                if (info.originFormID == 0) {
+                    info.originFormID = rawID;
+                }
+
+                if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(info.originFormID)) {
+                    info.displayName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", info.originFormID);
+                }
+                else {
+                    info.displayName = std::format("Unknown [{:08X}]", info.originFormID);
+                }
+            }
+            catch (...) {
+                info.originFormID = 0;
+                info.displayName = stem;
+            }
+            // --------------------------------------------------------
+
+            std::filesystem::path pngPath = entry.path();
+            pngPath.replace_extension(".png");
+
+            // Utiliza a função do SKSEMenuFramework para carregar a textura
+            if (std::filesystem::exists(pngPath)) {
+                info.textureID = SKSEMenuFramework::LoadTexture(pngPath.string());
+            }
+            else {
+                info.textureID = nullptr;
+            }
+
+            scannedFaces.push_back(info);
+        }
+    }
+    needFaceScan = false;
+}
+
 void DrawMainEditorUI() {
     bool isLocked = (!ui_linkedPreset.empty() && !isEditingPreset);
     bool hasErrors = false;
@@ -782,23 +1085,60 @@ void DrawMainEditorUI() {
     // Deteta se o utilizador alterou qualquer coisa no ecrã
     bool isDirty = HasUnsavedChanges();
 
-    std::map<RE::BGSHeadPart::HeadPartType, int> hpCounts;
+    // Novo mapa para agrupar HeadParts pela categoria e identificar duplicatas
+    std::map<RE::BGSHeadPart::HeadPartType, std::vector<RE::BGSHeadPart*>> hpByType;
+
     for (auto hp : ui_headParts) {
         if (!hp) continue;
-        if (!hp->flags.all(RE::BGSHeadPart::Flag::kIsExtraPart)) {
-            hpCounts[hp->type.get()]++;
-        }
 
+        // 1. Checa Incompatibilidade (Raça e Sexo)
         if (!IsHeadPartValid(hp, ui_race, ui_isFemale)) {
             hasErrors = true;
-            errorMsgs += std::format("- Incompatible part detected: {}\n", clib_util::editorID::get_editorID(hp));
+
+            std::string allowedRaces = GetValidRacesString(hp);
+
+            bool hpFemale = hp->flags.all(RE::BGSHeadPart::Flag::kFemale);
+            bool hpMale = hp->flags.all(RE::BGSHeadPart::Flag::kMale);
+            std::string allowedSex = "Any";
+            if (hpFemale && !hpMale) allowedSex = "Female";
+            else if (hpMale && !hpFemale) allowedSex = "Male";
+
+            std::string edid = clib_util::editorID::get_editorID(hp);
+            if (edid.empty()) edid = std::format("{:08X}", hp->GetFormID());
+
+            errorMsgs += std::format("- Incompatible: {} (Races: {} | Sex: {})\n", edid, allowedRaces, allowedSex);
+        }
+
+        // 2. Agrupa as HeadParts pelo Tipo Base (Ignorando kIsExtraPart)
+        if (!hp->flags.all(RE::BGSHeadPart::Flag::kIsExtraPart)) {
+            hpByType[hp->type.get()].push_back(hp);
         }
     }
-    for (auto& pair : hpCounts) {
-        if (pair.second > 1 && pair.first != RE::BGSHeadPart::HeadPartType::kMisc && pair.first != RE::BGSHeadPart::HeadPartType::kScar) {
+
+    // 3. Checa conflitos de múltiplas peças BASE do mesmo tipo
+    for (const auto& [type, parts] : hpByType) {
+        // kMisc e kScar são exceções, o Skyrim permite múltiplos deles
+        if (parts.size() > 1 && type != RE::BGSHeadPart::HeadPartType::kMisc && type != RE::BGSHeadPart::HeadPartType::kScar) {
             hasErrors = true;
-            errorMsgs += "- Multiple BASE HeadParts of the same unique type found!\n";
-            break;
+
+            std::string typeName = "Unknown";
+            switch (type) {
+            case RE::BGSHeadPart::HeadPartType::kHair: typeName = "Hair"; break;
+            case RE::BGSHeadPart::HeadPartType::kEyes: typeName = "Eyes"; break;
+            case RE::BGSHeadPart::HeadPartType::kFace: typeName = "Face"; break;
+            case RE::BGSHeadPart::HeadPartType::kEyebrows: typeName = "Eyebrows"; break;
+            case RE::BGSHeadPart::HeadPartType::kFacialHair: typeName = "Facial Hair"; break;
+            }
+
+            std::string conflictNames = "";
+            for (auto p : parts) {
+                std::string edid = clib_util::editorID::get_editorID(p);
+                if (edid.empty()) edid = std::format("{:08X}", p->GetFormID());
+                conflictNames += edid + ", ";
+            }
+            if (!conflictNames.empty()) { conflictNames.pop_back(); conflictNames.pop_back(); }
+
+            errorMsgs += std::format("- Conflict ({}): Multiple base parts -> [{}]\n", typeName, conflictNames);
         }
     }
 
@@ -817,7 +1157,10 @@ void DrawMainEditorUI() {
 
         if (!isEditingPreset) {
             ImGuiMCP::SameLine();
-            if (ImGuiMCP::Button("Revert to default")) { RevertNPC(); }
+            if (ImGuiMCP::Button("Undo Changes")) { RevertNPC(); }
+
+            ImGuiMCP::SameLine();
+            if (ImGuiMCP::Button("Restore Default")) { RestoreDefaultNPC(); }
 
             if (g_currentNPC) {
                 std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
@@ -920,38 +1263,117 @@ void DrawMainEditorUI() {
         }
 
         if (!ui_availablePresets.empty()) {
-            static int selPreset = 0;
-            if (selPreset >= ui_availablePresets.size()) selPreset = 0;
-
-            std::vector<const char*> presetCStr;
-            for (auto& p : ui_availablePresets) presetCStr.push_back(p.c_str());
-
             ImGuiMCP::Text("Apply Existing Preset:"); ImGuiMCP::SameLine();
-            ImGuiMCP::SetNextItemWidth(250.0f);
-            ImGuiMCP::Combo("##presetCombo", &selPreset, presetCStr.data(), static_cast<int>(presetCStr.size()));
-            ImGuiMCP::SameLine();
-            if (ImGuiMCP::Button("Apply and Link Preset")) {
-                std::string chosenPreset = ui_availablePresets[selPreset];
-                std::string pPath = std::format("{}/{}.json", PresetsPath, chosenPreset);
-                FILE* fp = nullptr;
-                fopen_s(&fp, pPath.c_str(), "rb");
-                if (fp) {
-                    char readBuffer[65536];
-                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                    rapidjson::Document doc;
-                    doc.ParseStream(is);
-                    fclose(fp);
-                    ParseJSONToUI(doc);
-                }
-                ui_linkedPreset = chosenPreset;
-                SaveData();
-                ApplyNPC();
+            if (ImGuiMCP::Button("Browse Presets")) {
+                RefreshAvailablePresets();
+                openPresetSelectModal = true;
             }
         }
         ImGuiMCP::Separator();
     }
 
+    // ==========================================
+    // MODAL DE SELEÇÃO DE PRESETS COM IMAGEM
+    // ==========================================
+    if (openPresetSelectModal) ImGuiMCP::OpenPopup("Select Preset");
+    if (ImGuiMCP::BeginPopupModal("Select Preset", &openPresetSelectModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char presetSearch[256] = "";
+        ImGuiMCP::InputText("Search Preset", presetSearch, sizeof(presetSearch));
+        ImGuiMCP::Separator();
+
+        std::string searchStr(presetSearch);
+        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
+
+        std::vector<size_t> filteredIdx;
+        for (size_t i = 0; i < scannedPresets.size(); i++) {
+            std::string lowerName = scannedPresets[i].name;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+            if (!searchStr.empty() && lowerName.find(searchStr) == std::string::npos) {
+                continue;
+            }
+            filteredIdx.push_back(i);
+        }
+
+        auto tableFlags = ImGuiMCP::ImGuiTableFlags_BordersInnerH | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_ScrollY;
+
+        if (ImGuiMCP::BeginTable("PresetSelectTable", 3, tableFlags, ImGuiMCP::ImVec2(800, 600))) {
+            ImGuiMCP::TableSetupColumn("Image", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 160.0f);
+            ImGuiMCP::TableSetupColumn("Details", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+            ImGuiMCP::TableSetupColumn("Action", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 130.0f);
+
+            int totalItems = static_cast<int>(filteredIdx.size());
+            static auto clipper = ImGuiMCP::ImGuiListClipperManager::Create();
+            ImGuiMCP::ImGuiListClipperManager::Begin(clipper, totalItems, 160.0f);
+
+            while (ImGuiMCP::ImGuiListClipperManager::Step(clipper)) {
+                for (int i = clipper->DisplayStart; i < clipper->DisplayEnd; i++) {
+                    if (i < 0 || i >= totalItems) continue;
+
+                    size_t sourceIdx = filteredIdx[i];
+                    if (sourceIdx >= scannedPresets.size()) continue;
+
+                    const auto& preset = scannedPresets[sourceIdx];
+
+                    ImGuiMCP::PushID(static_cast<int>(sourceIdx));
+                    ImGuiMCP::TableNextRow(ImGuiMCP::ImGuiTableRowFlags_None, 160.0f);
+
+                    // Coluna 0: Imagem
+                    ImGuiMCP::TableSetColumnIndex(0);
+                    if (preset.textureID) {
+                        ImGuiMCP::Image(preset.textureID, ImGuiMCP::ImVec2(150, 150));
+                    }
+                    else {
+                        ImGuiMCP::Dummy(ImGuiMCP::ImVec2(150, 150));
+                    }
+
+                    // Coluna 1: Texto
+                    ImGuiMCP::TableSetColumnIndex(1);
+                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f));
+                    ImGuiMCP::Text("%s", preset.name.c_str());
+
+                    // Coluna 2: Botão Ação
+                    ImGuiMCP::TableSetColumnIndex(2);
+                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f));
+                    if (ImGuiMCP::Button("Apply Preset", ImGuiMCP::ImVec2(120))) {
+                        std::string pPath = std::format("{}/{}.json", PresetsPath, preset.name);
+                        FILE* fp = nullptr;
+                        fopen_s(&fp, pPath.c_str(), "rb");
+                        if (fp) {
+                            char readBuffer[65536];
+                            rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+                            rapidjson::Document doc;
+                            doc.ParseStream(is);
+                            fclose(fp);
+                            ParseJSONToUI(doc); // Aplica JSON à Interface
+                        }
+                        ui_linkedPreset = preset.name;
+                        SaveData();
+                        ApplyNPC();
+
+                        openPresetSelectModal = false;
+                        ImGuiMCP::CloseCurrentPopup();
+                    }
+                    ImGuiMCP::PopID();
+                }
+            }
+            ImGuiMCP::ImGuiListClipperManager::End(clipper);
+            ImGuiMCP::EndTable();
+        }
+
+        ImGuiMCP::Separator();
+
+        if (ImGuiMCP::Button("Cancel", ImGuiMCP::ImVec2(120, 0))) {
+            openPresetSelectModal = false;
+            ImGuiMCP::CloseCurrentPopup();
+        }
+
+        ImGuiMCP::EndPopup();
+    }
+
     ImGuiMCP::Text("Basic Attributes");
+    bool prevIsFemale = ui_isFemale;
+    RE::TESRace* prevRace = ui_race;
     if (isLocked) ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "[LOCKED]");
     else {
         ImGuiMCP::SetNextItemWidth(200.0f);
@@ -968,6 +1390,148 @@ void DrawMainEditorUI() {
     DrawDropdown("Default Outfit", "Outfit", &ui_outfit, s_outfitIdx, isLocked);
     DrawDropdown("Sleep Outfit", "Outfit", &ui_sleepOutfit, s_sleepOutfitIdx, isLocked);
     DrawDropdown("Hair Color", "ColorForm", &ui_hairColor, s_hairColorIdx, isLocked);
+    if (prevRace != ui_race || prevIsFemale != ui_isFemale) {
+        for (auto& tl : ui_tintLayers) {
+            tl.name = GetSkinToneName(ui_race, ui_isFemale ? RE::SEX::kFemale : RE::SEX::kMale, tl.index);
+        }
+    }
+
+    ImGuiMCP::Separator();
+    ImGuiMCP::Text("Custom Face");
+    if (!ui_customFaceNif.empty()) {
+
+        // --- EXTRAIR NOME DO NPC PARA A UI ---
+        std::string displayFaceName = ui_customFaceNif;
+        size_t lastSlash = ui_customFaceNif.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            std::string stem = ui_customFaceNif.substr(lastSlash + 1);
+            size_t dot = stem.find_last_of(".");
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
+            try {
+                RE::FormID id = std::stoul(stem, nullptr, 16);
+                if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(id)) {
+                    displayFaceName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", id);
+                }
+                else {
+                    displayFaceName = std::format("Unknown [{:08X}]", id);
+                }
+            }
+            catch (...) {
+                displayFaceName = stem; // Fallback se não for um ID válido
+            }
+        }
+        // ------------------------------------
+
+        ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, "Loaded Sculpt: %s", displayFaceName.c_str());
+        if (ImGuiMCP::Button("Remove Sculpt")) {
+            ui_customFaceNif = "";
+        }
+    }
+    else {
+        ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "No custom face loaded.");
+    }
+
+    if (!isLocked && ImGuiMCP::Button("Browse Faces")) {
+        if (needFaceScan) ScanFaceGeom();
+        openFaceSelectModal = true;
+    }
+
+    // --- NIF SELECT MODAL ---
+    if (openFaceSelectModal) ImGuiMCP::OpenPopup("Select Face");
+    if (ImGuiMCP::BeginPopupModal("Select Face", &openFaceSelectModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char faceSearch[256] = "";
+        ImGuiMCP::InputText("Search Name/FormID", faceSearch, sizeof(faceSearch));
+        ImGuiMCP::Separator();
+
+        std::string searchStr(faceSearch);
+        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
+
+        // 1. Filtrar previamente os índices baseados na busca
+        std::vector<size_t> filteredIdx;
+        for (size_t i = 0; i < scannedFaces.size(); i++) {
+            std::string lowerName = scannedFaces[i].displayName;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+            if (!searchStr.empty() && lowerName.find(searchStr) == std::string::npos && scannedFaces[i].nifPath.find(searchStr) == std::string::npos) {
+                continue;
+            }
+            filteredIdx.push_back(i);
+        }
+
+        auto tableFlags = ImGuiMCP::ImGuiTableFlags_BordersInnerH | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_ScrollY;
+
+        // 2. Usar BeginTable e Clipper
+        if (ImGuiMCP::BeginTable("FaceNIFTable", 3, tableFlags, ImGuiMCP::ImVec2(800, 600))) {
+            ImGuiMCP::TableSetupColumn("Image", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 160.0f);
+            ImGuiMCP::TableSetupColumn("Details", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+            ImGuiMCP::TableSetupColumn("Action", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 130.0f);
+
+            int totalItems = static_cast<int>(filteredIdx.size());
+            static auto clipper = ImGuiMCP::ImGuiListClipperManager::Create();
+            ImGuiMCP::ImGuiListClipperManager::Begin(clipper, totalItems, 160.0f); // 160.0f força altura mínima da linha
+
+            while (ImGuiMCP::ImGuiListClipperManager::Step(clipper)) {
+                for (int i = clipper->DisplayStart; i < clipper->DisplayEnd; i++) {
+                    if (i < 0 || i >= totalItems) continue;
+
+                    size_t sourceIdx = filteredIdx[i];
+                    if (sourceIdx >= scannedFaces.size()) continue;
+
+                    const auto& face = scannedFaces[sourceIdx];
+
+                    ImGuiMCP::PushID(static_cast<int>(sourceIdx));
+                    ImGuiMCP::TableNextRow(ImGuiMCP::ImGuiTableRowFlags_None, 160.0f);
+
+                    // Coluna 0: Imagem
+                    ImGuiMCP::TableSetColumnIndex(0);
+                    if (face.textureID) {
+                        ImGuiMCP::Image(face.textureID, ImGuiMCP::ImVec2(150, 150));
+                    }
+                    else {
+                        ImGuiMCP::Dummy(ImGuiMCP::ImVec2(150, 150));
+                    }
+
+                    // Coluna 1: Textos Alinhados
+                    ImGuiMCP::TableSetColumnIndex(1);
+                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f)); // Desce um pouco o texto
+                    ImGuiMCP::Text("%s", face.displayName.c_str());
+
+                    // Mostra o path reduzido (sem a diretoria da engine)
+                    ImGuiMCP::TextDisabled("%s", face.displayPath.c_str());
+
+                    // Coluna 2: Botão de Ação
+                    ImGuiMCP::TableSetColumnIndex(2);
+                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f)); // Desce um pouco o botão
+                    if (ImGuiMCP::Button("Select Face", ImGuiMCP::ImVec2(120))) {
+                        ui_customFaceNif = face.nifPath; // O jogo ainda usa o path original
+
+                        RE::BGSHeadPart* targetHp = Manager::ExtractHeadPartFromNif(ui_customFaceNif);
+                        if (targetHp) {
+                            auto it = std::remove_if(ui_headParts.begin(), ui_headParts.end(), [](RE::BGSHeadPart* hp) {
+                                return hp && hp->type == RE::BGSHeadPart::HeadPartType::kFace;
+                                });
+                            ui_headParts.erase(it, ui_headParts.end());
+                            ui_headParts.push_back(targetHp);
+                        }
+                        openFaceSelectModal = false;
+                        ImGuiMCP::CloseCurrentPopup();
+                    }
+                    ImGuiMCP::PopID();
+                }
+            }
+            ImGuiMCP::ImGuiListClipperManager::End(clipper);
+            ImGuiMCP::EndTable();
+        }
+
+        ImGuiMCP::Separator();
+
+        if (ImGuiMCP::Button("Cancel", ImGuiMCP::ImVec2(120, 0))) {
+            openFaceSelectModal = false;
+            ImGuiMCP::CloseCurrentPopup();
+        }
+
+        ImGuiMCP::EndPopup();
+    }
 
     ImGuiMCP::Separator();
 
@@ -1225,88 +1789,112 @@ void NSettings::Presets() {
 
     static bool openApplyModal = false;
     static std::string presetToApply = "";
+    static std::set<RE::FormID> selectedNPCs;
+    static std::set<RE::FormID> originalSelectedNPCs; 
 
     // Variáveis para o Delete Modal
     static bool openDeleteModal = false;
     static std::string presetToDelete = "";
     static bool deleteLinkedNPCs = false;
 
-    // Alterado para 6 Colunas incluindo Deletar.
-    if (ImGuiMCP::BeginTable("PresetDB", 6, tableFlags)) {
+
+    if (ImGuiMCP::BeginTable("PresetDB", 7, tableFlags)) {
+        ImGuiMCP::TableSetupColumn("Image", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 100.0f);
         ImGuiMCP::TableSetupColumn("Edit", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGuiMCP::TableSetupColumn("Apply", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGuiMCP::TableSetupColumn("Export", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGuiMCP::TableSetupColumn("Delete", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGuiMCP::TableSetupColumn("Manage", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn("Export", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGuiMCP::TableSetupColumn("Delete", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGuiMCP::TableSetupColumn("Preset Name", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
         ImGuiMCP::TableSetupColumn("Affected NPCs", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
         ImGuiMCP::TableHeadersRow();
 
         for (const auto& pName : ui_availablePresets) {
-            ImGuiMCP::TableNextRow();
-
-            // Coluna 0 - Botão Editar
-            ImGuiMCP::TableSetColumnIndex(0);
             ImGuiMCP::PushID(pName.c_str());
+            ImGuiMCP::TableNextRow(ImGuiMCP::ImGuiTableRowFlags_None, 100.0f); // Força altura da linha
+
+            // Encontra a imagem do Preset (se existir)
+            void* texID = nullptr;
+            auto it = std::find_if(scannedPresets.begin(), scannedPresets.end(), [&](const CustomPresetInfo& p) { return p.name == pName; });
+            if (it != scannedPresets.end()) texID = it->textureID;
+
+            // Coluna 0 - Imagem
+            ImGuiMCP::TableSetColumnIndex(0);
+            if (texID) ImGuiMCP::Image(texID, ImGuiMCP::ImVec2(100, 100));
+            else ImGuiMCP::Dummy(ImGuiMCP::ImVec2(100, 100));
+
+            // Coluna 1 - Edit
+            ImGuiMCP::TableSetColumnIndex(1);
             if (ImGuiMCP::Button("Edit")) {
                 LoadPresetToUI(pName);
             }
 
-            // Coluna 1 - Botão Aplicar
-            ImGuiMCP::TableSetColumnIndex(1);
-            if (ImGuiMCP::Button("Apply")) {
+            // Coluna 2 - Manage (Antigo Apply)
+            ImGuiMCP::TableSetColumnIndex(2);
+            if (ImGuiMCP::Button("Manage")) {
                 presetToApply = pName;
+                selectedNPCs.clear();
+                originalSelectedNPCs.clear();
+
+                auto manager = Manager::GetSingleton();
+                const auto& npcList = manager->GetList("NPC");
+
+                // Pré-popula as checkboxes com os NPCs que já utilizam este preset
+                for (const auto& u : presetUsageDB[pName]) {
+                    for (const auto& item : npcList) {
+                        if (item.editorID == u || std::format("{:08X}", item.formID) == u) {
+                            selectedNPCs.insert(item.formID);
+                            originalSelectedNPCs.insert(item.formID);
+                            break;
+                        }
+                    }
+                }
                 openApplyModal = true;
             }
 
-            // Coluna 2 - Botão Exportar Preset
-            ImGuiMCP::TableSetColumnIndex(2);
+            // Coluna 3 - Export
+            ImGuiMCP::TableSetColumnIndex(3);
             if (isEditingPreset && activePresetName == pName && HasUnsavedChanges()) {
                 ImGuiMCP::TextColored({ 0.5f, 0.5f, 0.5f, 1.0f }, "Save First");
-                if (ImGuiMCP::IsItemHovered()) {
-                    ImGuiMCP::SetTooltip("This Preset is currently being edited and has unsaved changes.\nSave the data first.");
-                }
+                if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("This Preset is currently being edited and has unsaved changes.\nSave the data first.");
             }
             else {
-                if (ImGuiMCP::Button("Export")) {
-                    ExportPresetAsZip(pName);
-                }
-                if (ImGuiMCP::IsItemHovered()) {
-                    ImGuiMCP::SetTooltip("The .zip file will be saved in the folder:\nData/Exports");
-                }
+                if (ImGuiMCP::Button("Export")) ExportPresetAsZip(pName);
+                if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("The .zip file will be saved in the folder:\nData/Exports");
             }
 
-            // Coluna 3 - Botão Deletar (NOVO)
-            ImGuiMCP::TableSetColumnIndex(3);
+            // Coluna 4 - Delete
+            ImGuiMCP::TableSetColumnIndex(4);
             ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.8f, 0.2f, 0.2f, 1.0f });
             if (ImGuiMCP::Button("Delete")) {
                 presetToDelete = pName;
-                deleteLinkedNPCs = false; // Reseta o estado do checkbox
+                deleteLinkedNPCs = false;
                 openDeleteModal = true;
             }
             ImGuiMCP::PopStyleColor();
-            ImGuiMCP::PopID();
 
-            // Coluna 4 - Nome
-            ImGuiMCP::TableSetColumnIndex(4);
+            // Coluna 5 - Name
+            ImGuiMCP::TableSetColumnIndex(5);
             ImGuiMCP::Text("%s", pName.c_str());
 
-            // Coluna 5 - Uso
-            ImGuiMCP::TableSetColumnIndex(5);
+            // Coluna 6 - Affected NPCs
+            ImGuiMCP::TableSetColumnIndex(6);
             std::string users = "";
             for (const auto& u : presetUsageDB[pName]) users += u + ", ";
             if (!users.empty()) { users.pop_back(); users.pop_back(); }
             ImGuiMCP::TextWrapped("%s", users.empty() ? "None" : users.c_str());
+
+            ImGuiMCP::PopID(); 
         }
         ImGuiMCP::EndTable();
     }
 
     // =====================================
-    // MODAL DE APLICAR PRESET
-    // =====================================
-    if (openApplyModal) ImGuiMCP::OpenPopup("ModalAplicarPreset");
+        // MODAL DE GERENCIAR PRESET
+        // =====================================
+    if (openApplyModal) ImGuiMCP::OpenPopup("Manage Preset Links");
 
-    if (ImGuiMCP::BeginPopupModal("ModalAplicarPreset", &openApplyModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGuiMCP::Text("Select NPCs to link to preset: %s", presetToApply.c_str());
+    if (ImGuiMCP::BeginPopupModal("Manage Preset Links", &openApplyModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGuiMCP::Text("Manage NPCs linked to preset: %s", presetToApply.c_str());
         ImGuiMCP::Separator();
 
         static char modalFilter[256] = "";
@@ -1315,8 +1903,6 @@ void NSettings::Presets() {
 
         auto manager = Manager::GetSingleton();
         const auto& npcList = manager->GetList("NPC");
-
-        static std::set<RE::FormID> selectedNPCs;
 
         std::string search(modalFilter);
         std::transform(search.begin(), search.end(), search.begin(), ::tolower);
@@ -1359,16 +1945,38 @@ void NSettings::Presets() {
             for (size_t idx : filteredIdx) selectedNPCs.insert(npcList[idx].formID);
         }
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Uncheck All")) {
-            selectedNPCs.clear();
-        }
+        if (ImGuiMCP::Button("Uncheck All")) selectedNPCs.clear();
 
         ImGuiMCP::Spacing();
 
-        std::string btnApplyText = std::format("Apply and Save ({})", selectedNPCs.size());
+        std::string btnApplyText = std::format("Save Changes ({})", selectedNPCs.size());
         if (ImGuiMCP::Button(btnApplyText.c_str(), ImGuiMCP::ImVec2(180, 0))) {
 
-            // NOVO (1): Carrega o Preset em memória UMA VEZ antes de aplicar aos NPCs
+            // 1. Desvincula os NPCs que foram desmarcados e restaura o estado Vanilla
+            for (auto formID : originalSelectedNPCs) {
+                if (!selectedNPCs.contains(formID)) {
+                    Manager::GetSingleton()->UnregisterAffectedNPC(formID);
+                    if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
+                        std::string editorID = clib_util::editorID::get_editorID(npc);
+                        if (editorID.empty()) editorID = std::format("{:08X}", formID);
+                        std::string finalPath = std::format("{}/{}.json", NPCPath, editorID);
+
+                        // Apaga a ligação
+                        if (std::filesystem::exists(finalPath)) {
+                            std::filesystem::remove(finalPath);
+                        }
+
+                        // Restaura o estado em memória para Vanilla
+                        if (g_vanillaNPCStates.contains(formID)) {
+                            rapidjson::Document doc;
+                            doc.Parse(g_vanillaNPCStates[formID].c_str());
+                            Manager::ApplyNPCCustomizationFromJSON(npc, doc);
+                        }
+                    }
+                }
+            }
+
+            // 2. Aplica o Preset aos NPCs marcados
             rapidjson::Document presetDoc;
             std::string pPath = std::format("{}/{}.json", PresetsPath, presetToApply);
             FILE* pFp = nullptr;
@@ -1380,15 +1988,19 @@ void NSettings::Presets() {
                 fclose(pFp);
             }
 
+            std::string presetNif = "";
+            if (presetDoc.HasMember("customFaceNif") && presetDoc["customFaceNif"].IsString()) {
+                presetNif = presetDoc["customFaceNif"].GetString();
+            }
+
             for (auto formID : selectedNPCs) {
                 if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
 
-                    // NOVO (1): Aplica o Preset no TESNPC na memória
-                    if (presetDoc.IsObject()) {
-                        Manager::ApplyNPCCustomizationFromJSON(npc, presetDoc);
-                    }
+                    Manager::GetSingleton()->RegisterAffectedNPC(formID, presetNif);
+                    // Aplica em Memória
+                    if (presetDoc.IsObject()) Manager::ApplyNPCCustomizationFromJSON(npc, presetDoc);
 
-                    // Salva a alteração atrelando o preset no disco
+                    // Salva JSON no Disco
                     rapidjson::Document doc;
                     auto& allocator = doc.GetAllocator();
                     doc.SetObject();
@@ -1411,8 +2023,10 @@ void NSettings::Presets() {
                     }
                 }
             }
+
             needsUsageScan = true;
             selectedNPCs.clear();
+            originalSelectedNPCs.clear();
             modalFilter[0] = '\0';
             openApplyModal = false;
             ImGuiMCP::CloseCurrentPopup();
@@ -1420,6 +2034,7 @@ void NSettings::Presets() {
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button("Cancel", ImGuiMCP::ImVec2(120, 0))) {
             selectedNPCs.clear();
+            originalSelectedNPCs.clear();
             modalFilter[0] = '\0';
             openApplyModal = false;
             ImGuiMCP::CloseCurrentPopup();
@@ -1460,6 +2075,18 @@ void NSettings::Presets() {
             // Deleta os NPCs vinculados se o utilizador confirmou no checkbox
             if (deleteLinkedNPCs && !users.empty()) {
                 for (const auto& u : users) {
+                    RE::FormID formID = 0;
+                    if (auto form = RE::TESForm::LookupByEditorID(u)) {
+                        formID = form->GetFormID();
+                    }
+                    else {
+                        try { formID = std::stoul(u, nullptr, 16); }
+                        catch (...) {}
+                    }
+                    if (formID != 0) {
+                        Manager::GetSingleton()->UnregisterAffectedNPC(formID); 
+                    }
+
                     std::string nPath = std::format("{}/{}.json", NPCPath, u);
                     if (std::filesystem::exists(nPath)) {
                         std::filesystem::remove(nPath);
@@ -1709,6 +2336,11 @@ void NSettings::Load() {
             }
 
             if (targetNPC) {
+                if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
+                    std::string vanillaStr;
+                    CaptureVanillaState(targetNPC, vanillaStr);
+                    g_vanillaNPCStates[targetNPC->GetFormID()] = vanillaStr;
+                }
                 FILE* fp = nullptr;
                 fopen_s(&fp, entry.path().string().c_str(), "rb");
                 if (fp) {
@@ -1717,13 +2349,19 @@ void NSettings::Load() {
                     rapidjson::Document doc;
                     doc.ParseStream(is);
                     fclose(fp);
-
                     if (doc.IsObject()) {
+                        std::string nifPath = "";
+
                         if (doc.HasMember("preset") && doc["preset"].IsString()) {
                             std::string presetName = doc["preset"].GetString();
                             if (presetCache.find(presetName) != presetCache.end()) {
                                 Manager::ApplyNPCCustomizationFromJSON(targetNPC, presetCache[presetName]);
-                                countNPCsModificados++; // PONTO 7: Contador de NPCs
+
+                                if (presetCache[presetName].HasMember("customFaceNif") && presetCache[presetName]["customFaceNif"].IsString()) {
+                                    nifPath = presetCache[presetName]["customFaceNif"].GetString();
+                                }
+                                Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
+                                countNPCsModificados++;
                             }
                             else {
                                 logger::warn("NPC {} points to preset {} which does not exist.", filename, presetName);
@@ -1731,14 +2369,18 @@ void NSettings::Load() {
                         }
                         else {
                             Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
-                            countNPCsModificados++; // PONTO 7: Contador de NPCs Custom
+                            if (doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
+                                nifPath = doc["customFaceNif"].GetString();
+                            }
+                            Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
+                            countNPCsModificados++;
                         }
                     }
                 }
             }
         }
     }
-
+    ScanFaceGeom();
     // PONTO 7: LOG FINAL DE STATUS NO BOOT
     logger::info("[NPC Replacer] Loading complete: {} presets cached, {} modified NPCs applied.", countPresetsCarregados, countNPCsModificados);
 }
