@@ -14,6 +14,7 @@ static std::string activePresetName = "";
 
 // Atributos base
 static float ui_height = 1.0f;
+static float ui_weight = 50.0f;
 static float ui_bodyColor[4] = { 1.0f, 1.0f, 1.0f, 0.0f }; // R, G, B, A (QNAM restaurado para 4 valores)
 static bool ui_isFemale = false;
 static bool ui_oppositeGenderAnim = false;
@@ -33,7 +34,7 @@ static RE::TESObjectARMO* ui_skin = nullptr;
 static RE::BGSOutfit* ui_outfit = nullptr;
 static RE::BGSColorForm* ui_hairColor = nullptr;
 static RE::BGSOutfit* ui_sleepOutfit = nullptr;
-
+static RE::BGSVoiceType* ui_voice = nullptr;
 static std::vector<RE::BGSHeadPart*> ui_headParts;
 
 struct UITintLayer {
@@ -65,6 +66,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     doc.SetObject();
 
     doc.AddMember("height", npc->height, allocator);
+    doc.AddMember("weight", npc->weight, allocator);
     doc.AddMember("isFemale", npc->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kFemale), allocator);
     doc.AddMember("oppositeGenderAnim", npc->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims), allocator);
 
@@ -79,6 +81,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     if (npc->farSkin) doc.AddMember("skin", rapidjson::Value(FormUtil::NormalizeFormID(npc->farSkin).c_str(), allocator), allocator);
     if (npc->defaultOutfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->defaultOutfit).c_str(), allocator), allocator);
     if (npc->sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->sleepOutfit).c_str(), allocator), allocator);
+    if (npc->GetObjectVoiceType()) doc.AddMember("voice", rapidjson::Value(FormUtil::NormalizeFormID(npc->GetObjectVoiceType()).c_str(), allocator), allocator);
     if (npc->headRelatedData && npc->headRelatedData->hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(npc->headRelatedData->hairColor).c_str(), allocator), allocator);
 
     rapidjson::Value hpArray(rapidjson::kArrayType);
@@ -385,6 +388,7 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     doc.SetObject();
 
     doc.AddMember("height", ui_height, allocator);
+    doc.AddMember("weight", ui_weight, allocator);
     doc.AddMember("isFemale", ui_isFemale, allocator);
     doc.AddMember("oppositeGenderAnim", ui_oppositeGenderAnim, allocator);
 
@@ -398,7 +402,11 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     if (ui_race) doc.AddMember("race", rapidjson::Value(FormUtil::NormalizeFormID(ui_race).c_str(), allocator), allocator);
     if (ui_skin) doc.AddMember("skin", rapidjson::Value(FormUtil::NormalizeFormID(ui_skin).c_str(), allocator), allocator);
     if (ui_outfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_outfit).c_str(), allocator), allocator);
+    else doc.AddMember("defaultOutfit", "", allocator); 
     if (ui_sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_sleepOutfit).c_str(), allocator), allocator);
+    else doc.AddMember("sleepOutfit", "", allocator); 
+    /*if (ui_voice) doc.AddMember("voice", rapidjson::Value(FormUtil::NormalizeFormID(ui_voice).c_str(), allocator), allocator);
+    else doc.AddMember("voice", "", allocator); */
     if (ui_hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(ui_hairColor).c_str(), allocator), allocator);
     if (!ui_customFaceNif.empty()) {
         doc.AddMember("customFaceNif", rapidjson::Value(ui_customFaceNif.c_str(), allocator), allocator);
@@ -470,8 +478,10 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     ui_outfit = nullptr;
     ui_sleepOutfit = nullptr;
     ui_hairColor = nullptr;
+    ui_voice = nullptr;
     ui_customFaceNif = "";
     if (j.HasMember("height") && j["height"].IsFloat()) ui_height = j["height"].GetFloat();
+    if (j.HasMember("weight") && j["weight"].IsFloat()) ui_weight = j["weight"].GetFloat(); 
     if (j.HasMember("isFemale") && j["isFemale"].IsBool()) ui_isFemale = j["isFemale"].GetBool();
     if (j.HasMember("oppositeGenderAnim") && j["oppositeGenderAnim"].IsBool()) ui_oppositeGenderAnim = j["oppositeGenderAnim"].GetBool();
 
@@ -487,6 +497,7 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     if (j.HasMember("skin")) ui_skin = RE::TESForm::LookupByID<RE::TESObjectARMO>(FormUtil::FormIDFromString(j["skin"].GetString()));
     if (j.HasMember("defaultOutfit")) ui_outfit = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(j["defaultOutfit"].GetString()));
     if (j.HasMember("sleepOutfit")) ui_sleepOutfit = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(j["sleepOutfit"].GetString()));
+    if (j.HasMember("voice")) ui_voice = RE::TESForm::LookupByID<RE::BGSVoiceType>(FormUtil::FormIDFromString(j["voice"].GetString()));
     if (j.HasMember("hairColor")) ui_hairColor = RE::TESForm::LookupByID<RE::BGSColorForm>(FormUtil::FormIDFromString(j["hairColor"].GetString()));
 
     ui_headParts.clear();
@@ -670,6 +681,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     ui_customFaceNif = "";
 
     ui_height = g_currentNPC->height;
+    ui_weight = g_currentNPC->weight;
     ui_isFemale = g_currentNPC->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kFemale);
     ui_oppositeGenderAnim = g_currentNPC->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims);
 
@@ -682,6 +694,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     ui_skin = g_currentNPC->farSkin;
     ui_outfit = g_currentNPC->defaultOutfit;
     ui_sleepOutfit = g_currentNPC->sleepOutfit;
+    //ui_voice = g_currentNPC->GetObjectVoiceType();
     ui_hairColor = g_currentNPC->headRelatedData ? g_currentNPC->headRelatedData->hairColor : nullptr;
 
     ui_headParts.clear();
@@ -896,31 +909,30 @@ void ApplyNPC(bool force3DReset = true) {
 
             // 3. SCHEDULER: Queue deformation 500ms after Reset3D
             if (!nifToApply.empty()) {
-                logger::info("[UI] Agendando DeformFace para daqui a 500ms...");
                 Manager::ScheduleFaceDeform(g_currentActor->GetFormID(), nifToApply);
             }
         }
 
-        auto processLists = RE::ProcessLists::GetSingleton();
-        if (processLists) {
-            for (auto& actorHandle : processLists->highActorHandles) {
-                auto ref = actorHandle.get();
-                if (ref) {
-                    if (auto actor = ref->As<RE::Actor>()) {
-                        if (!actor->IsPlayerRef() && actor != g_currentActor && actor->GetActorBase() == g_currentNPC) {
-                            actor->UpdateHairColor();
-                            actor->UpdateSkinColor();
-                            //actor->DoReset3D(true);
+        //auto processLists = RE::ProcessLists::GetSingleton();
+        //if (processLists) {
+        //    for (auto& actorHandle : processLists->highActorHandles) {
+        //        auto ref = actorHandle.get();
+        //        if (ref) {
+        //            if (auto actor = ref->As<RE::Actor>()) {
+        //                if (!actor->IsPlayerRef() && actor != g_currentActor && actor->GetActorBase() == g_currentNPC) {
+        //                    actor->UpdateHairColor();
+        //                    actor->UpdateSkinColor();
+        //                    //actor->DoReset3D(true);
 
-                            // Queue deformation for all instanced actors using this base!
-                            if (!nifToApply.empty()) {
-                                Manager::ScheduleFaceDeform(actor->GetFormID(), nifToApply);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        //                    // Queue deformation for all instanced actors using this base!
+        //                    if (!nifToApply.empty()) {
+        //                        Manager::ScheduleFaceDeform(actor->GetFormID(), nifToApply);
+        //                    }
+        //                }
+        //            }
+        //        }
+        //    }
+        //}
     }
 }
 
@@ -1378,14 +1390,17 @@ void DrawMainEditorUI() {
     else {
         ImGuiMCP::SetNextItemWidth(200.0f);
         ImGuiMCP::InputFloat("Height", &ui_height, 0.01f, 0.1f, "%.3f");
+        ImGuiMCP::SetNextItemWidth(200.0f);
+        ImGuiMCP::InputFloat("Weight", &ui_weight, 1.0f, 10.0f, "%.1f");
         ImGuiMCP::ColorEdit4("Body Color (QNAM)", ui_bodyColor);
         ImGuiMCP::Checkbox("Female", &ui_isFemale);
         ImGuiMCP::SameLine();
         ImGuiMCP::Checkbox("Opposite Gender Anims", &ui_oppositeGenderAnim);
     }
 
-    static int s_raceIdx = 0, s_skinIdx = 0, s_outfitIdx = 0, s_sleepOutfitIdx = 0, s_hairColorIdx = 0;
+    static int s_raceIdx = 0, s_skinIdx = 0, s_outfitIdx = 0, s_sleepOutfitIdx = 0, s_hairColorIdx = 0, s_voiceIdx = 0;
     DrawDropdown("Race", "Race", &ui_race, s_raceIdx, isLocked);
+    //DrawDropdown("Voice Type", "Voice", &ui_voice, s_voiceIdx, isLocked);
     DrawDropdown("Worn Skin", "Armor", &ui_skin, s_skinIdx, isLocked);
     DrawDropdown("Default Outfit", "Outfit", &ui_outfit, s_outfitIdx, isLocked);
     DrawDropdown("Sleep Outfit", "Outfit", &ui_sleepOutfit, s_sleepOutfitIdx, isLocked);
@@ -2288,11 +2303,13 @@ void NSettings::MmRegister() {
         SKSEMenuFramework::AddSectionItem("NPC Editor", NPCMenu);
         SKSEMenuFramework::AddSectionItem("Presets", Presets);
         SKSEMenuFramework::AddSectionItem("NPC Database", NPCList);
+		logger::info("[MmRegister] Menu sections registered successfully.");
     }
 }
 
 // Carregamento de Inicialização (Auto-Load no jogo)
 void NSettings::Load() {
+    logger::info("[Load] Inicializando sistema de arquivos...");
     std::filesystem::create_directories(NPCPath);
     std::filesystem::create_directories(PresetsPath);
 
@@ -2300,30 +2317,49 @@ void NSettings::Load() {
     int countNPCsModificados = 0;
 
     std::map<std::string, rapidjson::Document> presetCache;
+
+    logger::info("[Load] Passo 1: Lendo arquivos na pasta de Presets...");
     for (const auto& entry : std::filesystem::directory_iterator(PresetsPath)) {
         if (entry.path().extension() == ".json") {
+            std::string presetName = entry.path().stem().string();
             FILE* fp = nullptr;
             fopen_s(&fp, entry.path().string().c_str(), "rb");
             if (fp) {
-                char readBuffer[65536];
-                rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                rapidjson::Document doc;
-                doc.ParseStream(is);
-                fclose(fp);
-                if (doc.IsObject()) {
-                    presetCache[entry.path().stem().string()] = std::move(doc);
-                    countPresetsCarregados++; // PONTO 7: Contador de Presets
+                try {
+                    char readBuffer[65536];
+                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+                    rapidjson::Document doc;
+                    doc.ParseStream(is);
+                    fclose(fp);
+                    if (doc.IsObject()) {
+                        presetCache[presetName] = std::move(doc);
+                        countPresetsCarregados++;
+                        logger::info("[Load] Preset cacheado com sucesso: {}", presetName);
+                    }
+                    else {
+                        logger::warn("[Load] Falha ao analisar o JSON (nao eh um objeto valido): {}", presetName);
+                    }
                 }
+                catch (...) {
+                    if (fp) fclose(fp);
+                    logger::error("[Load] Excecao ao ler o arquivo de Preset: {}", presetName);
+                }
+            }
+            else {
+                logger::error("[Load] Falha ao abrir o arquivo do Preset: {}", presetName);
             }
         }
     }
 
+    logger::info("[Load] Passo 2: Lendo arquivos na pasta de NPCs...");
     for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
         if (entry.path().extension() == ".json") {
             std::string filename = entry.path().stem().string();
+            logger::info("[Load] Processando arquivo de NPC: {}.json", filename);
 
             RE::TESNPC* targetNPC = nullptr;
 
+            // Tentativa de Lookup por EditorID ou FormID
             if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
                 targetNPC = edidForm->As<RE::TESNPC>();
             }
@@ -2332,28 +2368,43 @@ void NSettings::Load() {
                     RE::FormID id = std::stoul(filename, nullptr, 16);
                     if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
                 }
-                catch (...) {}
+                catch (...) {
+                    logger::warn("[Load] Arquivo '{}' tem nome invalido (Nao eh EditorID nem Hex FormID).", filename);
+                }
             }
 
-            if (targetNPC) {
-                if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
-                    std::string vanillaStr;
-                    CaptureVanillaState(targetNPC, vanillaStr);
-                    g_vanillaNPCStates[targetNPC->GetFormID()] = vanillaStr;
-                }
-                FILE* fp = nullptr;
-                fopen_s(&fp, entry.path().string().c_str(), "rb");
-                if (fp) {
+            if (!targetNPC) {
+                logger::error("[Load] Falha! NPC base '{}' nao encontrado na memoria do jogo.", filename);
+                continue; // Pula este arquivo
+            }
+
+            logger::info("[Load] NPC '{}' resolvido para FormID {:08X}. Lendo JSON...", filename, targetNPC->GetFormID());
+
+            // Salva Vanilla State antes de alterar
+            if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
+                std::string vanillaStr;
+                CaptureVanillaState(targetNPC, vanillaStr);
+                g_vanillaNPCStates[targetNPC->GetFormID()] = vanillaStr;
+            }
+
+            FILE* fp = nullptr;
+            fopen_s(&fp, entry.path().string().c_str(), "rb");
+            if (fp) {
+                try {
                     char readBuffer[65536];
                     rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
                     rapidjson::Document doc;
                     doc.ParseStream(is);
                     fclose(fp);
+
                     if (doc.IsObject()) {
                         std::string nifPath = "";
 
+                        // Verifica se este NPC usa um Preset linkado
                         if (doc.HasMember("preset") && doc["preset"].IsString()) {
                             std::string presetName = doc["preset"].GetString();
+                            logger::info("[Load] NPC {:08X} vinculado ao Preset '{}'.", targetNPC->GetFormID(), presetName);
+
                             if (presetCache.find(presetName) != presetCache.end()) {
                                 Manager::ApplyNPCCustomizationFromJSON(targetNPC, presetCache[presetName]);
 
@@ -2364,10 +2415,12 @@ void NSettings::Load() {
                                 countNPCsModificados++;
                             }
                             else {
-                                logger::warn("NPC {} points to preset {} which does not exist.", filename, presetName);
+                                logger::error("[Load] ABORTANDO: NPC {} aponta para preset '{}' que NAO FOI ENCONTRADO no cache.", filename, presetName);
                             }
                         }
                         else {
+                            // Edição única do NPC (Não é preset)
+                            logger::info("[Load] Aplicando JSON customizado unico para NPC {:08X}.", targetNPC->GetFormID());
                             Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
                             if (doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
                                 nifPath = doc["customFaceNif"].GetString();
@@ -2376,11 +2429,23 @@ void NSettings::Load() {
                             countNPCsModificados++;
                         }
                     }
+                    else {
+                        logger::error("[Load] O JSON do NPC '{}' nao e um objeto valido.", filename);
+                    }
                 }
+                catch (...) {
+                    if (fp) fclose(fp);
+                    logger::error("[Load] Excecao ao ler/aplicar o arquivo de NPC: {}", filename);
+                }
+            }
+            else {
+                logger::error("[Load] Falha ao abrir arquivo JSON do NPC: {}", filename);
             }
         }
     }
+
+    logger::info("[Load] Escaneando FaceGeoms dinâmicos...");
     ScanFaceGeom();
-    // PONTO 7: LOG FINAL DE STATUS NO BOOT
-    logger::info("[NPC Replacer] Loading complete: {} presets cached, {} modified NPCs applied.", countPresetsCarregados, countNPCsModificados);
+
+    logger::info("[NPC Replacer] BOOT CONCLUIDO: {} presets em cache, {} NPCs modificados com sucesso.", countPresetsCarregados, countNPCsModificados);
 }

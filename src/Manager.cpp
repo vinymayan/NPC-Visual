@@ -56,147 +56,191 @@ namespace FormUtil {
 }
 
 void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Document& doc) {
-    if (!npc) return;
-
-    npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kIsChargenFacePreset);
-
-    // 1. Atributos Básicos
-    if (doc.HasMember("height") && doc["height"].IsFloat()) {
-        npc->height = doc["height"].GetFloat();
+    if (!npc) {
+        logger::error("[ApplyJSON] Falha: Ponteiro de NPC nulo recebido.");
+        return;
     }
 
-    if (doc.HasMember("isFemale") && doc["isFemale"].IsBool()) {
-        if (doc["isFemale"].GetBool()) {
-            npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kFemale);
-        }
-        else {
-            npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kFemale);
-        }
-    }
+    std::string npcName = npc->GetFullName() ? npc->GetFullName() : "Unnamed";
+    logger::info("[ApplyJSON] === Iniciando aplicacao para NPC: {} [{:08X}] ===", npcName, npc->GetFormID());
 
-    if (doc.HasMember("oppositeGenderAnim") && doc["oppositeGenderAnim"].IsBool()) {
-        if (doc["oppositeGenderAnim"].GetBool()) {
-            npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims);
-        }
-        else {
-            npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims);
-        }
-    }
+    try {
+        npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kIsChargenFacePreset);
 
-    if (doc.HasMember("bodyTintColor")) {
-        auto& c = doc["bodyTintColor"];
-        npc->bodyTintColor.red = c.HasMember("r") ? c["r"].GetInt() : 255;
-        npc->bodyTintColor.green = c.HasMember("g") ? c["g"].GetInt() : 255;
-        npc->bodyTintColor.blue = c.HasMember("b") ? c["b"].GetInt() : 255;
-        npc->bodyTintColor.alpha = c.HasMember("a") ? c["a"].GetInt() : 255;
-    }
+        // 1. Atributos Básicos
+        logger::info("[ApplyJSON] [{:08X}] Passo 1: Aplicando atributos basicos...", npc->GetFormID());
+        if (doc.HasMember("height") && doc["height"].IsFloat()) {
+            npc->height = doc["height"].GetFloat();
+        }
 
-    // 2. Associações de IDs
-    if (doc.HasMember("race")) {
-        if (auto race = RE::TESForm::LookupByID<RE::TESRace>(FormUtil::FormIDFromString(doc["race"].GetString()))) {
-            npc->race = race;
+        if (doc.HasMember("weight") && doc["weight"].IsFloat()) {
+            npc->weight = doc["weight"].GetFloat();
         }
-    }
 
-    if (doc.HasMember("skin")) {
-        if (auto skin = RE::TESForm::LookupByID<RE::TESObjectARMO>(FormUtil::FormIDFromString(doc["skin"].GetString()))) {
-            npc->farSkin = skin;
+        if (doc.HasMember("isFemale") && doc["isFemale"].IsBool()) {
+            if (doc["isFemale"].GetBool()) npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kFemale);
+            else npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kFemale);
         }
-        else {
-            npc->farSkin = nullptr; // Reseta se não encontrar ou for "Nenhum"
-        }
-    }
 
-    if (doc.HasMember("defaultOutfit")) {
-        if (auto out = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(doc["defaultOutfit"].GetString()))) {
-            npc->defaultOutfit = out;
+        if (doc.HasMember("oppositeGenderAnim") && doc["oppositeGenderAnim"].IsBool()) {
+            if (doc["oppositeGenderAnim"].GetBool()) npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims);
+            else npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kOppositeGenderAnims);
         }
-        else {
-            npc->defaultOutfit = nullptr;
-        }
-    }
 
-    if (doc.HasMember("sleepOutfit")) {
-        if (auto out = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(doc["sleepOutfit"].GetString()))) {
-            npc->sleepOutfit = out;
+        if (doc.HasMember("bodyTintColor")) {
+            auto& c = doc["bodyTintColor"];
+            npc->bodyTintColor.red = c.HasMember("r") ? c["r"].GetInt() : 255;
+            npc->bodyTintColor.green = c.HasMember("g") ? c["g"].GetInt() : 255;
+            npc->bodyTintColor.blue = c.HasMember("b") ? c["b"].GetInt() : 255;
+            npc->bodyTintColor.alpha = c.HasMember("a") ? c["a"].GetInt() : 255;
         }
-        else {
-            npc->sleepOutfit = nullptr;
-        }
-    }
 
-    if (doc.HasMember("hairColor")) {
-        if (auto hc = RE::TESForm::LookupByID<RE::BGSColorForm>(FormUtil::FormIDFromString(doc["hairColor"].GetString()))) {
-            if (!npc->headRelatedData) {
-                npc->headRelatedData = new RE::TESNPC::HeadRelatedData();
+        // 2. Associações de IDs
+        logger::info("[ApplyJSON] [{:08X}] Passo 2: Resolvendo FormIDs de Race, Skin e Outfits...", npc->GetFormID());
+        if (doc.HasMember("race")) {
+            if (auto race = RE::TESForm::LookupByID<RE::TESRace>(FormUtil::FormIDFromString(doc["race"].GetString()))) {
+                npc->race = race;
             }
-            npc->headRelatedData->hairColor = hc;
-        }
-    }
-
-    // 3. HeadParts (Substituição de Array Dinâmico com Extra Parts)
-    if (doc.HasMember("headParts") && doc["headParts"].IsArray()) {
-        std::vector<RE::BGSHeadPart*> parts;
-        std::set<RE::BGSHeadPart*> processed; // <--- NOVO: Trava de segurança
-
-        std::function<void(RE::BGSHeadPart*)> AddPartAndExtras = [&](RE::BGSHeadPart* hp) {
-            if (!hp || processed.contains(hp)) return;
-            processed.insert(hp);
-
-            parts.push_back(hp);
-            for (auto* extra : hp->extraParts) {
-                if (extra) AddPartAndExtras(extra);
-            }
-            };
-
-        for (auto& hpJson : doc["headParts"].GetArray()) {
-            if (auto hp = RE::TESForm::LookupByID<RE::BGSHeadPart>(FormUtil::FormIDFromString(hpJson.GetString()))) {
-                AddPartAndExtras(hp);
+            else {
+                logger::warn("[ApplyJSON] [{:08X}] Falha ao encontrar Race ID.", npc->GetFormID());
             }
         }
 
-        if (npc->headParts) RE::free(npc->headParts);
-
-        if (!parts.empty()) {
-            auto newHeadParts = RE::calloc<RE::BGSHeadPart*>(parts.size());
-            for (size_t i = 0; i < parts.size(); ++i) newHeadParts[i] = parts[i];
-            npc->headParts = newHeadParts;
-            npc->numHeadParts = static_cast<int8_t>(parts.size());
+        if (doc.HasMember("skin")) {
+            if (auto skin = RE::TESForm::LookupByID<RE::TESObjectARMO>(FormUtil::FormIDFromString(doc["skin"].GetString()))) {
+                npc->farSkin = skin;
+            }
+            else {
+                npc->farSkin = nullptr;
+            }
         }
+
+        if (doc.HasMember("defaultOutfit")) {
+            if (auto out = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(doc["defaultOutfit"].GetString()))) {
+                npc->defaultOutfit = out;
+            }
+            else npc->defaultOutfit = nullptr;
+        }
+
+        if (doc.HasMember("sleepOutfit")) {
+            if (auto out = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(doc["sleepOutfit"].GetString()))) {
+                npc->sleepOutfit = out;
+            }
+            else npc->sleepOutfit = nullptr;
+        }
+
+        /*if (doc.HasMember("voice")) {
+            if (auto voice = RE::TESForm::LookupByID<RE::BGSVoiceType>(FormUtil::FormIDFromString(doc["voice"].GetString()))) {
+                npc->SetObjectVoiceType(voice);
+            }
+            else {
+                npc->SetObjectVoiceType(nullptr); 
+            }
+        }*/
+
+        if (doc.HasMember("hairColor")) {
+            if (auto hc = RE::TESForm::LookupByID<RE::BGSColorForm>(FormUtil::FormIDFromString(doc["hairColor"].GetString()))) {
+                if (!npc->headRelatedData) {
+                    logger::info("[ApplyJSON] [{:08X}] Alocando HeadRelatedData...", npc->GetFormID());
+                    npc->headRelatedData = new RE::TESNPC::HeadRelatedData();
+                }
+                npc->headRelatedData->hairColor = hc;
+            }
+        }
+
+        // 3. HeadParts
+        logger::info("[ApplyJSON] [{:08X}] Passo 3: Processando HeadParts...", npc->GetFormID());
+        if (doc.HasMember("headParts") && doc["headParts"].IsArray()) {
+            std::vector<RE::BGSHeadPart*> parts;
+            std::set<RE::BGSHeadPart*> processed;
+
+            std::function<void(RE::BGSHeadPart*)> AddPartAndExtras = [&](RE::BGSHeadPart* hp) {
+                if (!hp || processed.contains(hp)) return;
+                processed.insert(hp);
+                parts.push_back(hp);
+                for (auto* extra : hp->extraParts) {
+                    if (extra) AddPartAndExtras(extra);
+                }
+                };
+
+            for (auto& hpJson : doc["headParts"].GetArray()) {
+                if (auto hp = RE::TESForm::LookupByID<RE::BGSHeadPart>(FormUtil::FormIDFromString(hpJson.GetString()))) {
+                    AddPartAndExtras(hp);
+                }
+                else {
+                    logger::warn("[ApplyJSON] [{:08X}] HeadPart ID {} nao encontrado e sera ignorado.", npc->GetFormID(), hpJson.GetString());
+                }
+            }
+
+            if (npc->headParts) {
+                logger::info("[ApplyJSON] [{:08X}] Liberando memoria das HeadParts originais...", npc->GetFormID());
+                RE::free(npc->headParts);
+                npc->headParts = nullptr;
+            }
+
+            if (!parts.empty()) {
+                logger::info("[ApplyJSON] [{:08X}] Alocando {} novas HeadParts...", npc->GetFormID(), parts.size());
+                auto newHeadParts = RE::calloc<RE::BGSHeadPart*>(parts.size());
+                for (size_t i = 0; i < parts.size(); ++i) newHeadParts[i] = parts[i];
+                npc->headParts = newHeadParts;
+                npc->numHeadParts = static_cast<int8_t>(parts.size());
+            }
+            else {
+                npc->numHeadParts = 0;
+            }
+        }
+
+        // 4. Tint Layers
+        logger::info("[ApplyJSON] [{:08X}] Passo 4: Processando Tint Layers...", npc->GetFormID());
+        if (doc.HasMember("tintLayers") && doc["tintLayers"].IsArray()) {
+            if (!npc->tintLayers) {
+                logger::info("[ApplyJSON] [{:08X}] Criando novo array de TintLayers...", npc->GetFormID());
+                npc->tintLayers = new RE::BSTArray<RE::TESNPC::Layer*>();
+            }
+            else {
+                logger::info("[ApplyJSON] [{:08X}] Limpando {} TintLayers antigos...", npc->GetFormID(), npc->tintLayers->size());
+                npc->tintLayers->clear();
+            }
+
+            int idx = 0;
+            for (auto& l : doc["tintLayers"].GetArray()) {
+                auto layer = new RE::TESNPC::Layer();
+                layer->tintIndex = static_cast<uint16_t>(l["index"].GetInt());
+                auto& c = l["color"];
+                layer->tintColor.red = c.HasMember("r") ? c["r"].GetInt() : 0;
+                layer->tintColor.green = c.HasMember("g") ? c["g"].GetInt() : 0;
+                layer->tintColor.blue = c.HasMember("b") ? c["b"].GetInt() : 0;
+                layer->tintColor.alpha = c.HasMember("a") ? c["a"].GetInt() : 255;
+                layer->interpolationValue = static_cast<uint16_t>(l["interpolation"].GetFloat() * 100.0f);
+                layer->preset = static_cast<uint16_t>(l["preset"].GetInt());
+
+                npc->tintLayers->push_back(layer);
+                idx++;
+            }
+            logger::info("[ApplyJSON] [{:08X}] {} Tint Layers injetadas.", npc->GetFormID(), idx);
+        }
+
+        // 5. Face Morphs
+        logger::info("[ApplyJSON] [{:08X}] Passo 5: Processando Face Morphs...", npc->GetFormID());
+        if (doc.HasMember("faceMorphs") && doc["faceMorphs"].IsArray()) {
+            if (!npc->faceData) {
+                logger::info("[ApplyJSON] [{:08X}] Alocando memoria para FaceData...", npc->GetFormID());
+                npc->faceData = new RE::TESNPC::FaceData();
+            }
+            auto mArray = doc["faceMorphs"].GetArray();
+            for (rapidjson::SizeType i = 0; i < mArray.Size() && i < 19; i++) {
+                npc->faceData->morphs[i] = mArray[i].GetFloat();
+            }
+        }
+
+        logger::info("[ApplyJSON] === Sucesso absoluto para NPC: {:08X} ===", npc->GetFormID());
+
     }
-
-    // 4. Tint Layers
-    if (doc.HasMember("tintLayers") && doc["tintLayers"].IsArray()) {
-        logger::info("[DEBUG] Aplicando {} Tint Layers...", doc["tintLayers"].Size());
-        if (!npc->tintLayers) npc->tintLayers = new RE::BSTArray<RE::TESNPC::Layer*>();
-        else npc->tintLayers->clear();
-
-        for (auto& l : doc["tintLayers"].GetArray()) {
-            auto layer = new RE::TESNPC::Layer(); // Cria a nova layer
-            layer->tintIndex = static_cast<uint16_t>(l["index"].GetInt());
-            auto& c = l["color"];
-            layer->tintColor.red = c.HasMember("r") ? c["r"].GetInt() : 0;
-            layer->tintColor.green = c.HasMember("g") ? c["g"].GetInt() : 0;
-            layer->tintColor.blue = c.HasMember("b") ? c["b"].GetInt() : 0;
-            layer->tintColor.alpha = c.HasMember("a") ? c["a"].GetInt() : 255;
-
-            // O Skyrim salva a Opacidade variando de 0 a 100 inteiros
-            layer->interpolationValue = static_cast<uint16_t>(l["interpolation"].GetFloat() * 100.0f);
-            layer->preset = static_cast<uint16_t>(l["preset"].GetInt());
-
-            npc->tintLayers->push_back(layer);
-        }
+    catch (const std::exception& e) {
+        logger::error("[ApplyJSON] CRITICAL EXCEPTION no NPC {:08X}: {}", npc->GetFormID(), e.what());
     }
-
-    // 5. Face Morphs (Deslizantes do Rosto)
-    if (doc.HasMember("faceMorphs") && doc["faceMorphs"].IsArray()) {
-        if (!npc->faceData) {
-            npc->faceData = new RE::TESNPC::FaceData();
-        }
-        auto mArray = doc["faceMorphs"].GetArray();
-        for (rapidjson::SizeType i = 0; i < mArray.Size() && i < 19; i++) {
-            npc->faceData->morphs[i] = mArray[i].GetFloat();
-        }
+    catch (...) {
+        logger::error("[ApplyJSON] UNKNOWN EXCEPTION (Hard Crash evitado) no NPC {:08X}", npc->GetFormID());
     }
 }
 
@@ -231,6 +275,7 @@ void Manager::PopulateAllLists() {
     PopulateList<RE::BGSColorForm>("ColorForm");
     PopulateList<RE::TESNPC>("NPC");
     PopulateList<RE::TESObjectARMO>("Armor");
+    PopulateList<RE::BGSVoiceType>("Voice");
 
     _isPopulated = true;
     for (auto cb : _readyCallbacks) {
@@ -257,7 +302,7 @@ void Manager::RegisterReadyCallback(std::function<void()> callback) {
     }
 }
 
-// Altere a implementação:
+
 std::string Manager::ToUTF8(std::string_view a_str) {
     if (a_str.empty()) return "";
 
@@ -491,16 +536,26 @@ void Manager::DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifP
         return;
     }
 
-    // =============================================================================
-        // PARTE 1: MORPH DA CABEÇA (Substituindo o antigo Node Swap)
-        // =============================================================================
     if (oldHeadMesh && newHeadMesh) {
         RE::BSGeometry* oldGeo = oldHeadMesh->AsGeometry();
         RE::BSGeometry* newGeo = newHeadMesh->AsGeometry();
 
         auto oldDynShape = netimmerse_cast<RE::BSDynamicTriShape*>(oldGeo);
         auto newDynShape = netimmerse_cast<RE::BSDynamicTriShape*>(newGeo);
+        //auto oldLightingShader = netimmerse_cast<RE::BSLightingShaderProperty*>(oldGeo->GetGeometryRuntimeData().shaderProperty.get());
+        //auto newLightingShader = netimmerse_cast<RE::BSLightingShaderProperty*>(newGeo->GetGeometryRuntimeData().shaderProperty.get());
 
+        //if (oldLightingShader && newLightingShader) {
+        //    auto oldMaterial = static_cast<RE::BSLightingShaderMaterialBase*>(oldLightingShader->material);
+        //    auto newMaterial = static_cast<RE::BSLightingShaderMaterialBase*>(newLightingShader->material);
+        //    if (oldMaterial && newMaterial) {
+        //        newMaterial->textureSet = oldMaterial->textureSet;
+        //    }
+        //    newLightingShader->DoClearRenderPasses();
+        //    newLightingShader->SetupGeometry(newGeo);
+        //}
+
+        newGeo->GetGeometryRuntimeData().alphaProperty = oldGeo->GetGeometryRuntimeData().alphaProperty;
         if (oldDynShape && newDynShape) {
             uint32_t oldVertCount = oldDynShape->GetTrishapeRuntimeData().vertexCount;
             uint32_t newVertCount = newDynShape->GetTrishapeRuntimeData().vertexCount;
@@ -527,7 +582,6 @@ void Manager::DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifP
                 if (newFod) {
                     newFod->vertexCount = oldVertCount;
                     newFod->modelVertexCount = oldVertCount;
-                    // Aloca a memória usando a contagem de vértices do modelo
                     newFod->vertexData = (RE::NiPoint3*)RE::MemoryManager::GetSingleton()->Allocate(sizeof(RE::NiPoint3) * oldVertCount, 0, false);
 
                     for (uint32_t i = 0; i < oldVertCount; ++i) {
@@ -587,14 +641,9 @@ void Manager::DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifP
         }
     }
 
-    // =============================================================================
-        // PARTE 2: MORPH INJECTION (Para Sobrancelhas, Olhos, Boca, etc)
-        // =============================================================================
-        // Nota: "Head" foi removido daqui pois ja foi processado na PARTE 1
-        // Keywords todas em minusculo para facilitar o match case-insensitive
+
     std::vector<std::string> morphKeywords = { "brows", "eyes", "mouth", "beard", "scar" };
 
-    // Iteramos por TODOS os filhos do faceNode do ator (NPC no jogo)
     for (auto& actorChild : faceNode->GetChildren()) {
         if (!actorChild || !actorChild->name.c_str()) continue;
 
@@ -692,7 +741,7 @@ void Manager::DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifP
                                                                 origVerts[v].y = nifVerts[v].y;
                                                                 origVerts[v].z = nifVerts[v].z;
                                                             }
-                                                            logger::info("  -> FMD de '{}' atualizado com sucesso!", actorName);
+                                                           // logger::info("  -> FMD de '{}' atualizado com sucesso!", actorName);
                                                         }
                                                     }
                                                     break;
@@ -717,17 +766,13 @@ void Manager::DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifP
         }
     }
 
-    // =============================================================================
-    // PARTE 3: FINALIZAÇÃO DA ENGINE
-    // A cor não é mais aplicada aqui, apenas re-atrelamos as animações
-    // =============================================================================
-    faceNode->FixSkinInstances(skeletonRoot, true);
 
-    if (savedAnimData) {
-        savedAnimData->lock.Lock();
-        savedAnimData->exprOverride = true;
-        savedAnimData->lock.Unlock();
-        //logger::info("[Face Swap] exprOverride ativada para regenerar as expressoes faciais.");
+    faceNode->FixSkinInstances(skeletonRoot, false);
+
+    if (auto npcBase = a_actor->GetActorBase()) {
+        if (auto npc = npcBase->As<RE::TESNPC>()) {
+            npc->UpdateNeck(faceNode);
+        }
     }
 
     logger::info("[Face Swap] === Concluida! ===");
@@ -743,7 +788,7 @@ void Manager::ScheduleFaceDeform(RE::FormID actorID, const std::string& nifPath,
         // Log apenas na primeira tentativa para não floodar
         if (retries == 20) logger::info("[TIMER] Thread de deformação iniciada para {:08X}. Aguardando 3D...", actorID);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
         SKSE::GetTaskInterface()->AddTask([actorID, nifPath, retries]() {
             auto pActor = RE::TESForm::LookupByID<RE::Actor>(actorID);

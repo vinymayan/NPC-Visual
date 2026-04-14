@@ -103,7 +103,7 @@ void Load3DHook::ProcessPrismaLoad3D(RE::TESObjectREFR* a_this, RE::NiAVObject* 
 
         if (isActor) {
             if (a_this->Is3DLoaded()) {
-                logger::info("[LOAD3D] Malha 3D carregada para {}RefID: {:08X}. Inspecionando FMDs...", typeStr, a_this->GetFormID());
+                //logger::info("[LOAD3D] Malha 3D carregada para {}RefID: {:08X}. Inspecionando FMDs...", typeStr, a_this->GetFormID());
 
                 // --- INJEÇÃO DO LOG DE RASTREIO DIRETO DO RESULT3D ---
                 //LogAllFMDs(result3D, a_this->GetFormID(), "ProcessPrismaLoad3D_Imediato");
@@ -113,7 +113,7 @@ void Load3DHook::ProcessPrismaLoad3D(RE::TESObjectREFR* a_this, RE::NiAVObject* 
                     if (auto base = actor->GetActorBase()) {
                         std::string nifPath;
                         if (Manager::GetSingleton()->IsNPCAffected(base->GetFormID(), nifPath)) {
-                            logger::info("[LOAD3D] {}RefID: {:08X} e afetado por um NIF custom. Agendando deformacao facial...", typeStr, a_this->GetFormID());
+                            //logger::info("[LOAD3D] {}RefID: {:08X} e afetado por um NIF custom. Agendando deformacao facial...", typeStr, a_this->GetFormID());
                             Manager::ScheduleFaceDeform(actor->GetFormID(), nifPath, 20);
                         }
                     }
