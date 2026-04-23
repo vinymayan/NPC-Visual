@@ -1010,7 +1010,7 @@ void ScanFaceGeom() {
     scannedFaces.clear();
     std::filesystem::path geomPath = "Data/meshes/actors/character/FaceGenData/FaceGeom";
 
-    std::error_code ec; 
+    std::error_code ec;
     if (!std::filesystem::exists(geomPath, ec) || ec) {
         logger::warn("[ScanFaceGeom] FaceGeom path does not exist or cannot be accessed.");
         return;
@@ -1018,7 +1018,7 @@ void ScanFaceGeom() {
 
     logger::info("[ScanFaceGeom] Starting FaceGeom scan...");
 
-    // Adiciona flag para pular arquivos/pastas sem permissão (evita crash do filesystem)
+    // Adiciona flag para pular arquivos/pastas sem permissão
     auto options = std::filesystem::directory_options::skip_permission_denied;
 
     for (auto it = std::filesystem::recursive_directory_iterator(geomPath, options, ec);
@@ -1027,15 +1027,20 @@ void ScanFaceGeom() {
 
         if (ec) {
             logger::error("[ScanFaceGeom] Filesystem iteration error: {}", ec.message());
-            continue; // Pula o arquivo/pasta com erro e continua
+            continue;
         }
 
         if (it->is_regular_file() && it->path().extension() == ".nif") {
             CustomFaceInfo info;
-            std::string fullPath = it->path().string();
 
             try {
-                // Substitui barras para garantir que o Find funciona corretamente no Windows
+                // A conversão .string() foi movida para DENTRO do try. 
+                // Evita o crash "No mapping for the Unicode character"
+                std::string fullPath = it->path().string();
+
+                // Log detalhado para rastrear onde o scanner está (pode mudar para logger::info se preferir)
+                logger::debug("[ScanFaceGeom] Analyzing NIF: {}", fullPath);
+
                 std::string normalizedPath = fullPath;
                 std::replace(normalizedPath.begin(), normalizedPath.end(), '/', '\\');
 
@@ -1053,20 +1058,35 @@ void ScanFaceGeom() {
                     info.displayPath = info.nifPath;
                 }
 
-                std::string stem = it->path().stem().string(); // Ex: "00123456"
-                std::string pluginFolder = it->path().parent_path().filename().string(); // Ex: "Skyrim.esm"
+                // 3. Resolução do Nome
+                std::string stem = it->path().stem().string();
+                std::string pluginFolder = it->path().parent_path().filename().string();
 
                 info.originFormID = 0;
 
-                try {
-                    // Tenta converter o nome do arquivo para número
+                // --- CHECAGEM ESTRITA DE HEXADECIMAL ---
+                // Verifica se o nome é 100% FormID. Evita que nomes como "bela_rosto" 
+                // sejam lidos parcialmente como hex (0xBE).
+                bool isStrictHex = true;
+                if (stem.empty() || stem.length() > 8) {
+                    isStrictHex = false;
+                }
+                else {
+                    for (char c : stem) {
+                        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                            isStrictHex = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (isStrictHex) {
+                    // É um FormID de NPC
                     uint32_t rawID = std::stoul(stem, nullptr, 16);
                     auto dataHandler = RE::TESDataHandler::GetSingleton();
 
                     if (dataHandler) {
-                        // Busca o arquivo do mod para saber se é um ESL (Light plugin)
                         const RE::TESFile* modFile = dataHandler->LookupModByName(pluginFolder);
-
                         if (modFile) {
                             uint32_t localID = 0;
 
@@ -1081,12 +1101,8 @@ void ScanFaceGeom() {
                         }
                     }
 
-                    // Fallback se falhou ao buscar no DataHandler
-                    if (info.originFormID == 0) {
-                        info.originFormID = rawID;
-                    }
+                    if (info.originFormID == 0) info.originFormID = rawID;
 
-                    // Resolução de Nome para UI
                     if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(info.originFormID)) {
                         info.displayName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", info.originFormID);
                     }
@@ -1094,13 +1110,9 @@ void ScanFaceGeom() {
                         info.displayName = std::format("Unknown [{:08X}]", info.originFormID);
                     }
                 }
-                catch (const std::invalid_argument&) {
-                    logger::warn("[ScanFaceGeom] Invalid NIF filename (Not Hex): {}", stem);
-                    info.originFormID = 0;
-                    info.displayName = stem;
-                }
-                catch (const std::out_of_range&) {
-                    logger::warn("[ScanFaceGeom] NIF filename value out of range: {}", stem);
+                else {
+                    // É UM ARQUIVO COM NOME CUSTOMIZADO (Ex: "Rosto_da_Lydia")
+                    logger::info("[ScanFaceGeom] Custom Face detected (Non-FormID): {}", stem);
                     info.originFormID = 0;
                     info.displayName = stem;
                 }
@@ -1119,11 +1131,15 @@ void ScanFaceGeom() {
                 scannedFaces.push_back(info);
 
             }
+            // CATCH ESPECÍFICO PARA O ERRO DE UNICODE DO WINDOWS
+            catch (const std::system_error& se) {
+                logger::error("[ScanFaceGeom] Filesystem/Unicode encoding error reading a file. Skipping it. Info: {}", se.what());
+            }
             catch (const std::exception& e) {
-                logger::error("[ScanFaceGeom] Exception processing file {}: {}", fullPath, e.what());
+                logger::error("[ScanFaceGeom] Standard Exception processing file: {}", e.what());
             }
             catch (...) {
-                logger::error("[ScanFaceGeom] Unknown critical exception processing file: {}", fullPath);
+                logger::error("[ScanFaceGeom] Unknown critical exception processing a FaceGeom file.");
             }
         }
     }
