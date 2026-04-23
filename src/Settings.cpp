@@ -694,7 +694,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     ui_skin = g_currentNPC->farSkin;
     ui_outfit = g_currentNPC->defaultOutfit;
     ui_sleepOutfit = g_currentNPC->sleepOutfit;
-    //ui_voice = g_currentNPC->GetObjectVoiceType();
+    ui_voice = g_currentNPC->GetObjectVoiceType();
     ui_hairColor = g_currentNPC->headRelatedData ? g_currentNPC->headRelatedData->hairColor : nullptr;
 
     ui_headParts.clear();
@@ -1009,83 +1009,126 @@ static bool openFaceSelectModal = false;
 void ScanFaceGeom() {
     scannedFaces.clear();
     std::filesystem::path geomPath = "Data/meshes/actors/character/FaceGenData/FaceGeom";
-    if (!std::filesystem::exists(geomPath)) return;
 
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(geomPath)) {
-        if (entry.path().extension() == ".nif") {
+    std::error_code ec; 
+    if (!std::filesystem::exists(geomPath, ec) || ec) {
+        logger::warn("[ScanFaceGeom] FaceGeom path does not exist or cannot be accessed.");
+        return;
+    }
+
+    logger::info("[ScanFaceGeom] Starting FaceGeom scan...");
+
+    // Adiciona flag para pular arquivos/pastas sem permissão (evita crash do filesystem)
+    auto options = std::filesystem::directory_options::skip_permission_denied;
+
+    for (auto it = std::filesystem::recursive_directory_iterator(geomPath, options, ec);
+        it != std::filesystem::recursive_directory_iterator();
+        it.increment(ec)) {
+
+        if (ec) {
+            logger::error("[ScanFaceGeom] Filesystem iteration error: {}", ec.message());
+            continue; // Pula o arquivo/pasta com erro e continua
+        }
+
+        if (it->is_regular_file() && it->path().extension() == ".nif") {
             CustomFaceInfo info;
-
-            std::string fullPath = entry.path().string();
-            // Substitui barras para garantir que o Find funciona corretamente no Windows
-            std::string normalizedPath = fullPath;
-            std::replace(normalizedPath.begin(), normalizedPath.end(), '/', '\\');
-
-            // 1. Path Relativo para a Game Engine
-            size_t meshPos = normalizedPath.find("meshes\\");
-            if (meshPos != std::string::npos) info.nifPath = normalizedPath.substr(meshPos);
-            else info.nifPath = normalizedPath;
-
-            // 2. Path para a UI (Apenas depois de FaceGeom)
-            size_t faceGeomPos = normalizedPath.find("FaceGeom\\");
-            if (faceGeomPos != std::string::npos) {
-                // +9 salta a palavra "FaceGeom\"
-                info.displayPath = normalizedPath.substr(faceGeomPos + 9);
-            }
-            else {
-                info.displayPath = info.nifPath;
-            }
-
-            // --- LÓGICA DE DETECÇÃO DINÂMICA DE FORMID POR PLUGIN ---
-            std::string stem = entry.path().stem().string(); // Ex: "00123456"
-            std::string pluginFolder = entry.path().parent_path().filename().string(); // Ex: "Skyrim.esm"
+            std::string fullPath = it->path().string();
 
             try {
-                // Converte a string hexadecimal do arquivo para FormID numérico
-                uint32_t rawID = std::stoul(stem, nullptr, 16);
+                // Substitui barras para garantir que o Find funciona corretamente no Windows
+                std::string normalizedPath = fullPath;
+                std::replace(normalizedPath.begin(), normalizedPath.end(), '/', '\\');
 
-                // Remove os bytes de Load Order herdados do CK (mantém apenas o Local ID)
-                uint32_t localID = rawID & 0x00FFFFFF;
+                // 1. Path Relativo para a Game Engine
+                size_t meshPos = normalizedPath.find("meshes\\");
+                if (meshPos != std::string::npos) info.nifPath = normalizedPath.substr(meshPos);
+                else info.nifPath = normalizedPath;
 
-                auto dataHandler = RE::TESDataHandler::GetSingleton();
-                info.originFormID = 0;
-
-                // Tenta resolver dinamicamente usando o DataHandler (Funciona para ESP/ESM e ESLs)
-                if (dataHandler) {
-                    info.originFormID = dataHandler->LookupFormID(localID, pluginFolder);
-                }
-
-                // Fallback de segurança (caso seja um arquivo sem o formato pluginFolder correto)
-                if (info.originFormID == 0) {
-                    info.originFormID = rawID;
-                }
-
-                if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(info.originFormID)) {
-                    info.displayName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", info.originFormID);
+                // 2. Path para a UI
+                size_t faceGeomPos = normalizedPath.find("FaceGeom\\");
+                if (faceGeomPos != std::string::npos) {
+                    info.displayPath = normalizedPath.substr(faceGeomPos + 9);
                 }
                 else {
-                    info.displayName = std::format("Unknown [{:08X}]", info.originFormID);
+                    info.displayPath = info.nifPath;
                 }
+
+                std::string stem = it->path().stem().string(); // Ex: "00123456"
+                std::string pluginFolder = it->path().parent_path().filename().string(); // Ex: "Skyrim.esm"
+
+                info.originFormID = 0;
+
+                try {
+                    // Tenta converter o nome do arquivo para número
+                    uint32_t rawID = std::stoul(stem, nullptr, 16);
+                    auto dataHandler = RE::TESDataHandler::GetSingleton();
+
+                    if (dataHandler) {
+                        // Busca o arquivo do mod para saber se é um ESL (Light plugin)
+                        const RE::TESFile* modFile = dataHandler->LookupModByName(pluginFolder);
+
+                        if (modFile) {
+                            uint32_t localID = 0;
+
+                            if (modFile->IsLight()) {
+                                localID = rawID & 0x00000FFF;
+                            }
+                            else {
+                                localID = rawID & 0x00FFFFFF;
+                            }
+
+                            info.originFormID = dataHandler->LookupFormID(localID, pluginFolder);
+                        }
+                    }
+
+                    // Fallback se falhou ao buscar no DataHandler
+                    if (info.originFormID == 0) {
+                        info.originFormID = rawID;
+                    }
+
+                    // Resolução de Nome para UI
+                    if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(info.originFormID)) {
+                        info.displayName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", info.originFormID);
+                    }
+                    else {
+                        info.displayName = std::format("Unknown [{:08X}]", info.originFormID);
+                    }
+                }
+                catch (const std::invalid_argument&) {
+                    logger::warn("[ScanFaceGeom] Invalid NIF filename (Not Hex): {}", stem);
+                    info.originFormID = 0;
+                    info.displayName = stem;
+                }
+                catch (const std::out_of_range&) {
+                    logger::warn("[ScanFaceGeom] NIF filename value out of range: {}", stem);
+                    info.originFormID = 0;
+                    info.displayName = stem;
+                }
+
+                // Carregamento de Textura (PNG)
+                std::filesystem::path pngPath = it->path();
+                pngPath.replace_extension(".png");
+
+                if (std::filesystem::exists(pngPath, ec)) {
+                    info.textureID = SKSEMenuFramework::LoadTexture(pngPath.string());
+                }
+                else {
+                    info.textureID = nullptr;
+                }
+
+                scannedFaces.push_back(info);
+
+            }
+            catch (const std::exception& e) {
+                logger::error("[ScanFaceGeom] Exception processing file {}: {}", fullPath, e.what());
             }
             catch (...) {
-                info.originFormID = 0;
-                info.displayName = stem;
+                logger::error("[ScanFaceGeom] Unknown critical exception processing file: {}", fullPath);
             }
-            // --------------------------------------------------------
-
-            std::filesystem::path pngPath = entry.path();
-            pngPath.replace_extension(".png");
-
-            // Utiliza a função do SKSEMenuFramework para carregar a textura
-            if (std::filesystem::exists(pngPath)) {
-                info.textureID = SKSEMenuFramework::LoadTexture(pngPath.string());
-            }
-            else {
-                info.textureID = nullptr;
-            }
-
-            scannedFaces.push_back(info);
         }
     }
+
+    logger::info("[ScanFaceGeom] Scan completed. Faces found: {}", scannedFaces.size());
     needFaceScan = false;
 }
 
