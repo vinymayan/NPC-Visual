@@ -605,13 +605,13 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
             ImGuiMCP::Separator();
 
             std::string searchStr = searchBuf;
-            std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
+            std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), [](unsigned char c) { return std::tolower(c); });
 
             ImGuiMCP::BeginChild("##scroll", ImGuiMCP::ImVec2(0, 200), false);
             for (int i = 0; i < comboItems.size(); i++) {
                 std::string itemStr = comboItems[i];
                 std::string itemLower = itemStr;
-                std::transform(itemLower.begin(), itemLower.end(), itemLower.begin(), ::tolower);
+                std::transform(itemLower.begin(), itemLower.end(), itemLower.begin(), [](unsigned char c) { return std::tolower(c); });
 
                 // Mostra apenas itens que contém o que foi digitado
                 if (searchStr.empty() || itemLower.find(searchStr) != std::string::npos) {
@@ -1353,12 +1353,12 @@ void DrawMainEditorUI() {
         ImGuiMCP::Separator();
 
         std::string searchStr(presetSearch);
-        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
+        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), [](unsigned char c) { return std::tolower(c); });
 
         std::vector<size_t> filteredIdx;
         for (size_t i = 0; i < scannedPresets.size(); i++) {
             std::string lowerName = scannedPresets[i].name;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return std::tolower(c); });
 
             if (!searchStr.empty() && lowerName.find(searchStr) == std::string::npos) {
                 continue;
@@ -1518,13 +1518,13 @@ void DrawMainEditorUI() {
         ImGuiMCP::Separator();
 
         std::string searchStr(faceSearch);
-        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
+        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), [](unsigned char c) { return std::tolower(c); });
 
         // 1. Filtrar previamente os índices baseados na busca
         std::vector<size_t> filteredIdx;
         for (size_t i = 0; i < scannedFaces.size(); i++) {
             std::string lowerName = scannedFaces[i].displayName;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return std::tolower(c); });
 
             if (!searchStr.empty() && lowerName.find(searchStr) == std::string::npos && scannedFaces[i].nifPath.find(searchStr) == std::string::npos) {
                 continue;
@@ -1979,12 +1979,12 @@ void NSettings::Presets() {
         const auto& npcList = manager->GetList("NPC");
 
         std::string search(modalFilter);
-        std::transform(search.begin(), search.end(), search.begin(), ::tolower);
+        std::transform(search.begin(), search.end(), search.begin(), [](unsigned char c) { return std::tolower(c); });
         std::vector<size_t> filteredIdx;
         for (size_t i = 0; i < npcList.size(); i++) {
             if (!search.empty()) {
-                std::string n = npcList[i].name; std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-                std::string e = npcList[i].editorID; std::transform(e.begin(), e.end(), e.begin(), ::tolower);
+                std::string n = npcList[i].name; std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return std::tolower(c); });
+                std::string e = npcList[i].editorID; std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return std::tolower(c); });
                 if (n.find(search) == std::string::npos && e.find(search) == std::string::npos) continue;
             }
             filteredIdx.push_back(i);
@@ -2244,7 +2244,7 @@ void NSettings::NPCList() {
     if (searchChanged || toggleChanged || cachedFilteredIndices.empty()) {
         cachedFilteredIndices.clear();
         std::string search(filterBuffer);
-        std::transform(search.begin(), search.end(), search.begin(), ::tolower);
+        std::transform(search.begin(), search.end(), search.begin(), [](unsigned char c) { return std::tolower(c); });
 
         for (size_t i = 0; i < npcList.size(); i++) {
             const auto& item = npcList[i];
@@ -2254,8 +2254,8 @@ void NSettings::NPCList() {
             if (showOnlyAffected && !isAffected) continue;
 
             if (!search.empty()) {
-                std::string n = item.name; std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-                std::string e = item.editorID; std::transform(e.begin(), e.end(), e.begin(), ::tolower);
+                std::string n = item.name; std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return std::tolower(c); });
+                std::string e = item.editorID; std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return std::tolower(c); });
                 if (n.find(search) == std::string::npos && e.find(search) == std::string::npos) continue;
             }
             cachedFilteredIndices.push_back(i);
@@ -2358,10 +2358,10 @@ void NSettings::NPCMenu() {
 
 void NSettings::MmRegister() {
     if (SKSEMenuFramework::IsInstalled()) {
-        SKSEMenuFramework::SetSection("NPC Editor");
-        SKSEMenuFramework::AddSectionItem("NPC Editor", NPCMenu);
+        SKSEMenuFramework::SetSection("NPC Visual Editor");
+        SKSEMenuFramework::AddSectionItem("Editor", NPCMenu);
         SKSEMenuFramework::AddSectionItem("Presets", Presets);
-        SKSEMenuFramework::AddSectionItem("NPC Database", NPCList);
+        SKSEMenuFramework::AddSectionItem("Database", NPCList);
 		logger::info("[MmRegister] Menu sections registered successfully.");
     }
 }

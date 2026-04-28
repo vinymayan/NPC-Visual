@@ -306,20 +306,26 @@ void Manager::RegisterReadyCallback(std::function<void()> callback) {
 std::string Manager::ToUTF8(std::string_view a_str) {
     if (a_str.empty()) return "";
 
-    // Converte string_view para data temporária para o WinAPI
+    // 1. Testa se a string já é um UTF-8 válido
+    int u8Test = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, a_str.data(), static_cast<int>(a_str.size()), nullptr, 0);
+    if (u8Test > 0) {
+        // É UTF-8 válido (Skyrim SE nativo), retorna sem corromper
+        return std::string(a_str);
+    }
+
+    // 2. Se falhou, a string é ANSI (Mod antigo ou locale específico do Windows).
+    // Precisamos converter de ANSI (CP_ACP) para UTF-16, e depois para UTF-8.
     int wlen = MultiByteToWideChar(CP_ACP, 0, a_str.data(), static_cast<int>(a_str.size()), nullptr, 0);
     if (wlen <= 0) return std::string(a_str);
 
     std::wstring wstr(wlen, 0);
     MultiByteToWideChar(CP_ACP, 0, a_str.data(), static_cast<int>(a_str.size()), &wstr[0], wlen);
 
-    int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), wlen, nullptr, 0, nullptr, nullptr);
     if (u8len <= 0) return std::string(a_str);
 
     std::string u8str(u8len, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &u8str[0], u8len, nullptr, nullptr);
-
-    if (!u8str.empty() && u8str.back() == '\0') u8str.pop_back();
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), wlen, &u8str[0], u8len, nullptr, nullptr);
 
     return u8str;
 }
