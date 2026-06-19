@@ -1008,6 +1008,8 @@ static bool openFaceSelectModal = false;
 
 void ScanFaceGeom() {
     scannedFaces.clear();
+    auto* manager = Manager::GetSingleton();
+    manager->ClearFaceGenGeometryIndex();
     std::filesystem::path geomPath = "Data/meshes/actors/character/FaceGenData/FaceGeom";
 
     std::error_code ec;
@@ -1129,6 +1131,7 @@ void ScanFaceGeom() {
                 }
 
                 scannedFaces.push_back(info);
+                manager->IndexFaceGenNif(info.nifPath, info.originFormID);
 
             }
             // CATCH ESPECÍFICO PARA O ERRO DE UNICODE DO WINDOWS
@@ -1144,7 +1147,10 @@ void ScanFaceGeom() {
         }
     }
 
-    logger::info("[ScanFaceGeom] Scan completed. Faces found: {}", scannedFaces.size());
+    logger::info("[ScanFaceGeom] Scan completed. Faces found: {}. Baked geometries indexed: {}. Duplicates ignored: {}.",
+        scannedFaces.size(),
+        manager->GetFaceGenGeometryIndexSize(),
+        manager->GetFaceGenGeometryDuplicateCount());
     needFaceScan = false;
 }
 

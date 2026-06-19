@@ -36,6 +36,13 @@ struct InternalFormInfo {
     }
 };
 
+struct FaceGenGeometrySource {
+    std::string nifPath;
+    std::string geometryName;
+    RE::FormID originFormID = 0;
+    std::string kind;
+};
+
 class Manager {
 public:
     static Manager* GetSingleton() {
@@ -60,6 +67,11 @@ public:
     static void DeformFaceToMatchNif(RE::Actor* a_actor, const std::string& a_nifPath);
     static void ScheduleFaceDeform(RE::FormID actorID, const std::string& nifPath, int retries = 40);
     static RE::BGSHeadPart* ExtractHeadPartFromNif(const std::string& a_nifPath);
+    void ClearFaceGenGeometryIndex();
+    void IndexFaceGenNif(const std::string& nifPath, RE::FormID originFormID);
+    bool FindIndexedFaceGenGeometry(const std::string& geometryName, FaceGenGeometrySource& outSource) const;
+    std::size_t GetFaceGenGeometryIndexSize() const;
+    std::size_t GetFaceGenGeometryDuplicateCount() const;
 
 private:
     Manager() = default;
@@ -71,5 +83,7 @@ private:
     std::map<std::string, std::vector<InternalFormInfo>> _dataStore;
     std::vector<std::function<void()>> _readyCallbacks;
     std::map<RE::FormID, std::string> _affectedNPCs;
+    std::map<std::string, FaceGenGeometrySource> _faceGenGeometryIndex;
+    std::size_t _faceGenGeometryDuplicates = 0;
 };
 
