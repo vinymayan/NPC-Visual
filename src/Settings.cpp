@@ -1,13 +1,307 @@
 ﻿#include "Settings.h"
 #include "Manager.h"
 
-const char* BasePath = "Data/SKSE/Plugins/NPC Replacer";
-const char* NPCPath = "Data/SKSE/Plugins/NPC Replacer/NPC";
-const char* PresetsPath = "Data/SKSE/Plugins/NPC Replacer/Presets";
+const char* BasePath = "Data/Viny Mods/NPC Visual";
+const char* NPCPath = "Data/Viny Mods/NPC Visual/NPC";
+const char* PresetsPath = "Data/Viny Mods/NPC Visual/Presets";
+const char* ExportPath = "Data/Viny Mods/NPC Visual/Export";
+const char* LanguagePath = "Data/Viny Mods/NPC Visual/Language.json";
+
+const char* LegacyBasePath = "Data/SKSE/Plugins/NPC Replacer";
+const char* LegacyNPCPath = "Data/SKSE/Plugins/NPC Replacer/NPC";
+const char* LegacyPresetsPath = "Data/SKSE/Plugins/NPC Replacer/Presets";
 
 // Variaveis de estado para a UI
 static RE::Actor* g_currentActor = nullptr;
 static RE::TESNPC* g_currentNPC = nullptr;
+
+static std::map<std::string, std::string> g_loc;
+
+static void WriteDefaultLanguageFile()
+{
+    if (std::filesystem::exists(LanguagePath)) {
+        return;
+    }
+
+    std::filesystem::create_directories(BasePath);
+    rapidjson::Document doc;
+    auto& allocator = doc.GetAllocator();
+    doc.SetObject();
+    doc.AddMember("menu.editor", "Editor", allocator);
+    doc.AddMember("menu.presets", "Presets", allocator);
+    doc.AddMember("menu.database", "Database", allocator);
+    doc.AddMember("menu.export", "Export", allocator);
+    doc.AddMember("export.title", "Export Package", allocator);
+    doc.AddMember("export.description", "Select presets and NPC edits to export into one ZIP package.", allocator);
+    doc.AddMember("export.refresh", "Refresh Lists", allocator);
+    doc.AddMember("export.export_selected", "Export Selected", allocator);
+    doc.AddMember("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export.", allocator);
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, LanguagePath, "wb");
+    if (!fp) {
+        return;
+    }
+    char writeBuffer[65536];
+    rapidjson::FileWriteStream os(fp, writeBuffer, sizeof(writeBuffer));
+    rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(os);
+    doc.Accept(writer);
+    fclose(fp);
+}
+
+static void LoadLanguage()
+{
+    g_loc.clear();
+    WriteDefaultLanguageFile();
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, LanguagePath, "rb");
+    if (!fp) {
+        return;
+    }
+
+    char readBuffer[65536];
+    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+    rapidjson::Document doc;
+    doc.ParseStream(is);
+    fclose(fp);
+
+    if (!doc.IsObject()) {
+        return;
+    }
+
+    for (auto it = doc.MemberBegin(); it != doc.MemberEnd(); ++it) {
+        if (it->name.IsString() && it->value.IsString()) {
+            g_loc[it->name.GetString()] = it->value.GetString();
+        }
+    }
+}
+
+static const char* GetLoc(const char* key, const char* fallback)
+{
+    auto it = g_loc.find(key);
+    return it != g_loc.end() ? it->second.c_str() : fallback;
+}
+
+static void CopyDirectoryFilesIfMissing(const std::filesystem::path& from, const std::filesystem::path& to)
+{
+    if (!std::filesystem::exists(from)) {
+        return;
+    }
+
+    std::filesystem::create_directories(to);
+    for (const auto& entry : std::filesystem::directory_iterator(from)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const auto ext = entry.path().extension().string();
+        if (ext != ".json" && ext != ".png") {
+            continue;
+        }
+
+        const auto target = to / entry.path().filename();
+        if (!std::filesystem::exists(target)) {
+            std::error_code ec;
+            std::filesystem::copy_file(entry.path(), target, std::filesystem::copy_options::none, ec);
+            if (ec) {
+                logger::warn("[Migration] Failed to copy '{}' to '{}': {}", entry.path().string(), target.string(), ec.message());
+            }
+        }
+    }
+}
+
+static void EnsureStorageDirectories()
+{
+    std::filesystem::create_directories(BasePath);
+    std::filesystem::create_directories(NPCPath);
+    std::filesystem::create_directories(PresetsPath);
+    std::filesystem::create_directories(ExportPath);
+
+    // IMPORTANTE:
+    // Nao copie arquivos do legacy aqui. Esta funcao roda no boot, no refresh da UI
+    // e em varios fluxos de leitura. Se ela copiar aqui, a migracao acontece antes
+    // do usuario salvar qualquer dado. A migracao legacy -> novo caminho deve
+    // acontecer apenas depois de SaveData()/gravacao bem-sucedida.
+    WriteDefaultLanguageFile();
+}
+
+static std::vector<std::filesystem::path> CollectJsonFiles(const std::filesystem::path& primary, const std::filesystem::path& legacy)
+{
+    std::vector<std::filesystem::path> result;
+    std::set<std::string> seen;
+    auto collect = [&](const std::filesystem::path& dir) {
+        if (!std::filesystem::exists(dir)) {
+            return;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                continue;
+            }
+            const auto stem = entry.path().stem().string();
+            if (seen.insert(stem).second) {
+                result.push_back(entry.path());
+            }
+        }
+        };
+
+    collect(primary);
+    collect(legacy);
+    return result;
+}
+
+static std::filesystem::path ResolveJsonPath(const std::string& folder, const std::string& legacyFolder, const std::string& name)
+{
+    const auto primary = std::filesystem::path(folder) / (name + ".json");
+    if (std::filesystem::exists(primary)) {
+        return primary;
+    }
+
+    const auto legacy = std::filesystem::path(legacyFolder) / (name + ".json");
+    if (std::filesystem::exists(legacy)) {
+        return legacy;
+    }
+
+    return primary;
+}
+
+static void RemoveJsonInBothLocations(const std::string& folder, const std::string& legacyFolder, const std::string& name)
+{
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::path(folder) / (name + ".json"), ec);
+    ec.clear();
+    std::filesystem::remove(std::filesystem::path(legacyFolder) / (name + ".json"), ec);
+}
+
+static bool ReadJsonObjectFromFile(const std::filesystem::path& path, rapidjson::Document& outDoc, const char* context)
+{
+    outDoc.SetObject();
+
+    FILE* fp = nullptr;
+    const auto pathStr = path.string();
+    fopen_s(&fp, pathStr.c_str(), "rb");
+    if (!fp) {
+        logger::warn("[{}] Falha ao abrir JSON: {}", context, pathStr);
+        return false;
+    }
+
+    try {
+        char readBuffer[65536];
+        rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+        outDoc.ParseStream(is);
+        fclose(fp);
+        fp = nullptr;
+    }
+    catch (...) {
+        if (fp) {
+            fclose(fp);
+        }
+        logger::error("[{}] Excecao ao ler JSON: {}", context, pathStr);
+        return false;
+    }
+
+    if (outDoc.HasParseError()) {
+        logger::error("[{}] JSON invalido: {} offset={} code={}",
+            context,
+            pathStr,
+            outDoc.GetErrorOffset(),
+            static_cast<int>(outDoc.GetParseError()));
+        return false;
+    }
+
+    if (!outDoc.IsObject()) {
+        logger::error("[{}] JSON nao e objeto: {}", context, pathStr);
+        return false;
+    }
+
+    return true;
+}
+
+static void OverlayJsonObject(rapidjson::Document& dst, const rapidjson::Document& src)
+{
+    if (!dst.IsObject()) {
+        dst.SetObject();
+    }
+    if (!src.IsObject()) {
+        return;
+    }
+
+    auto& allocator = dst.GetAllocator();
+    for (auto it = src.MemberBegin(); it != src.MemberEnd(); ++it) {
+        if (!it->name.IsString()) {
+            continue;
+        }
+
+        const auto key = it->name.GetString();
+        auto dstIt = dst.FindMember(key);
+        if (dstIt != dst.MemberEnd()) {
+            dstIt->value.CopyFrom(it->value, allocator);
+        }
+        else {
+            rapidjson::Value name;
+            name.SetString(it->name.GetString(), it->name.GetStringLength(), allocator);
+            rapidjson::Value value;
+            value.CopyFrom(it->value, allocator);
+            dst.AddMember(name, value, allocator);
+        }
+    }
+}
+
+static void RemoveLegacyFileIfExists(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) && !ec) {
+        ec.clear();
+        std::filesystem::remove(path, ec);
+        if (ec) {
+            logger::warn("[Migration] Failed to remove legacy file '{}': {}", path.string(), ec.message());
+        }
+    }
+}
+
+static void CopyLegacySidecarIfMissing(const std::filesystem::path& legacyPath, const std::filesystem::path& newPath)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(legacyPath, ec) || ec) {
+        return;
+    }
+    ec.clear();
+    if (std::filesystem::exists(newPath, ec) && !ec) {
+        return;
+    }
+
+    ec.clear();
+    std::filesystem::create_directories(newPath.parent_path(), ec);
+    ec.clear();
+    std::filesystem::copy_file(legacyPath, newPath, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        logger::warn("[Migration] Failed to copy legacy sidecar '{}' to '{}': {}",
+            legacyPath.string(),
+            newPath.string(),
+            ec.message());
+    }
+}
+
+static void FinalizeLegacyMigrationAfterSave(const std::string& folder, const std::string& legacyFolder, const std::string& name)
+{
+    const auto legacyJson = std::filesystem::path(legacyFolder) / (name + ".json");
+    const auto legacyPng = std::filesystem::path(legacyFolder) / (name + ".png");
+    const auto newPng = std::filesystem::path(folder) / (name + ".png");
+
+    // O JSON novo ja foi escrito pelo SaveData. Copiamos apenas sidecars, como thumbs .png.
+    CopyLegacySidecarIfMissing(legacyPng, newPng);
+
+    // So depois da gravacao/copia bem-sucedida tentamos limpar o legacy.
+    RemoveLegacyFileIfExists(legacyJson);
+
+    std::error_code ec;
+    if (!std::filesystem::exists(legacyPng, ec) || ec) {
+        return;
+    }
+    ec.clear();
+    if (std::filesystem::exists(newPng, ec) && !ec) {
+        RemoveLegacyFileIfExists(legacyPng);
+    }
+}
 
 static bool isEditingPreset = false;
 static std::string activePresetName = "";
@@ -77,12 +371,12 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     bodyTint.AddMember("a", npc->bodyTintColor.alpha, allocator);
     doc.AddMember("bodyTintColor", bodyTint, allocator);
 
-    if (npc->race) doc.AddMember("race", rapidjson::Value(FormUtil::NormalizeFormID(npc->race).c_str(), allocator), allocator);
-    if (npc->farSkin) doc.AddMember("skin", rapidjson::Value(FormUtil::NormalizeFormID(npc->farSkin).c_str(), allocator), allocator);
-    if (npc->defaultOutfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->defaultOutfit).c_str(), allocator), allocator);
-    if (npc->sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(npc->sleepOutfit).c_str(), allocator), allocator);
-    if (npc->GetObjectVoiceType()) doc.AddMember("voice", rapidjson::Value(FormUtil::NormalizeFormID(npc->GetObjectVoiceType()).c_str(), allocator), allocator);
-    if (npc->headRelatedData && npc->headRelatedData->hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(npc->headRelatedData->hairColor).c_str(), allocator), allocator);
+    if (npc->race) doc.AddMember("race", FormUtil::MakeFormRef(npc->race, allocator), allocator);
+    if (npc->farSkin) doc.AddMember("skin", FormUtil::MakeFormRef(npc->farSkin, allocator), allocator);
+    if (npc->defaultOutfit) doc.AddMember("defaultOutfit", FormUtil::MakeFormRef(npc->defaultOutfit, allocator), allocator);
+    if (npc->sleepOutfit) doc.AddMember("sleepOutfit", FormUtil::MakeFormRef(npc->sleepOutfit, allocator), allocator);
+    if (npc->GetObjectVoiceType()) doc.AddMember("voice", FormUtil::MakeFormRef(npc->GetObjectVoiceType(), allocator), allocator);
+    if (npc->headRelatedData && npc->headRelatedData->hairColor) doc.AddMember("hairColor", FormUtil::MakeFormRef(npc->headRelatedData->hairColor, allocator), allocator);
 
     rapidjson::Value hpArray(rapidjson::kArrayType);
     std::set<RE::BGSHeadPart*> ownedExtraParts;
@@ -100,8 +394,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
         if (npc->headParts && npc->headParts[i]) {
             auto hp = npc->headParts[i];
             if (ownedExtraParts.find(hp) == ownedExtraParts.end()) {
-                std::string hpStr = FormUtil::NormalizeFormID(hp);
-                hpArray.PushBack(rapidjson::Value(hpStr.c_str(), allocator), allocator);
+                hpArray.PushBack(FormUtil::MakeFormRef(hp, allocator), allocator);
             }
         }
     }
@@ -140,16 +433,155 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     outJson = buffer.GetString();
 }
 
+static rapidjson::Document BuildSafeCustomizationDocument(RE::TESNPC* npc, const rapidjson::Document& loadedDoc)
+{
+    rapidjson::Document safeDoc;
+    safeDoc.SetObject();
+
+    // Arquivos legacy podem nao possuir campos que o aplicador atual espera.
+    // Baseamos o documento no estado vanilla do NPC e sobrescrevemos com o JSON carregado.
+    if (npc) {
+        std::string baseState;
+        const auto id = npc->GetFormID();
+        auto it = g_vanillaNPCStates.find(id);
+        if (it != g_vanillaNPCStates.end()) {
+            baseState = it->second;
+        }
+        else {
+            logger::debug("[JSONCompat] Capturando vanilla state para NPC {:08X} antes de aplicar JSON.", id);
+            CaptureVanillaState(npc, baseState);
+            g_vanillaNPCStates[id] = baseState;
+            logger::debug("[JSONCompat] Vanilla state capturado para NPC {:08X}.", id);
+        }
+
+        safeDoc.Parse(baseState.c_str());
+        if (safeDoc.HasParseError() || !safeDoc.IsObject()) {
+            safeDoc.SetObject();
+        }
+    }
+
+    OverlayJsonObject(safeDoc, loadedDoc);
+    return safeDoc;
+}
+
 // ==========================================
-// CONTROLADOR DE ALTERAÇÕES NÃO GUARDADAS
+// CONTROLADOR DE ALTERA��ES N�O GUARDADAS
 // ==========================================
 static std::string g_lastSavedStateStr = "";
 static std::string g_lastSavedPresetLink = "";
 
 static std::string ui_customFaceNif = "";
 
+struct CustomFaceInfo {
+    std::string nifPath;
+    std::string displayPath;
+    std::string displayName;
+    RE::FormID originFormID;
+    void* textureID;
+};
+static std::vector<CustomFaceInfo> scannedFaces;
+static bool needFaceScan = true;
+static bool openFaceSelectModal = false;
+static bool refreshListsOnNextMenuOpen = true;
+static int lastNPCVisualRenderFrame = -1;
+
+void ScanFaceGeom();
+
+void EnsureMenuListsPopulated()
+{
+    auto* manager = Manager::GetSingleton();
+    if (!manager->_isPopulated) {
+        manager->PopulateAllLists();
+    }
+}
+
+static std::string NormalizeGamePath(std::string path)
+{
+    std::replace(path.begin(), path.end(), '/', '\\');
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+    return path;
+}
+
+static std::string ResolveFaceDisplayName(const std::string& nifPath)
+{
+    const auto key = NormalizeGamePath(nifPath);
+    for (const auto& face : scannedFaces) {
+        if (NormalizeGamePath(face.nifPath) == key) {
+            return face.displayName;
+        }
+    }
+
+    std::filesystem::path path(nifPath);
+    const auto stem = path.stem().string();
+    const auto pluginFolder = path.parent_path().filename().string();
+    bool isStrictHex = !stem.empty() && stem.length() <= 8;
+    for (const char c : stem) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            isStrictHex = false;
+            break;
+        }
+    }
+
+    if (isStrictHex) {
+        RE::FormID formID = 0;
+        try {
+            const auto rawID = static_cast<std::uint32_t>(std::stoul(stem, nullptr, 16));
+            if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                if (const auto* modFile = dataHandler->LookupModByName(pluginFolder)) {
+                    const auto localID = modFile->IsLight() ? (rawID & 0x00000FFF) : (rawID & 0x00FFFFFF);
+                    formID = dataHandler->LookupFormID(localID, pluginFolder);
+                }
+            }
+            if (formID == 0) {
+                formID = rawID;
+            }
+        }
+        catch (...) {
+            formID = 0;
+        }
+
+        if (auto* npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
+            return std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", formID);
+        }
+        if (formID != 0) {
+            return std::format("{} [{:08X}]", pluginFolder.empty() ? "FaceGeom" : pluginFolder, formID);
+        }
+    }
+
+    return stem.empty() ? nifPath : stem;
+}
+
+static std::string ResolveDefaultFaceGeomPath(RE::TESNPC* npc)
+{
+    if (!npc) {
+        return {};
+    }
+
+    for (const auto& face : scannedFaces) {
+        if (face.originFormID == npc->GetFormID()) {
+            return face.nifPath;
+        }
+    }
+
+    const auto* file = FormUtil::GetMasterFile(npc);
+    if (!file) {
+        return {};
+    }
+
+    const auto localID = file->IsLight() ? (npc->GetFormID() & 0x00000FFF) : (npc->GetFormID() & 0x00FFFFFF);
+    auto nifPath = std::format("meshes\\actors\\character\\FaceGenData\\FaceGeom\\{}\\{:08X}.nif", file->GetFilename(), localID);
+    auto dataPath = std::filesystem::path("Data") / nifPath;
+    if (std::filesystem::exists(dataPath)) {
+        return nifPath;
+    }
+
+    return {};
+}
+
 // ==========================================
-// FUNÇÕES DE EXPORTAÇÃO ZIP (MINIZ)
+// FUN��ES DE EXPORTA��O ZIP (MINIZ)
 // ==========================================
 std::string SanitizeFilename(std::string name) {
     std::string invalid = "<>:/\\|?*\"";
@@ -161,11 +593,12 @@ std::string SanitizeFilename(std::string name) {
 
 void ExportPresetAsZip(const std::string& presetName) {
     namespace fs = std::filesystem;
-    std::string sourcePath = std::format("{}/{}.json", PresetsPath, presetName);
+    EnsureStorageDirectories();
+    std::string sourcePath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, presetName).string();
     if (!fs::exists(sourcePath)) return;
 
-    // PONTO 4: Pasta padrão de exports
-    fs::path exportDir = "Data/Exports";
+    // PONTO 4: Pasta padr�o de exports
+    fs::path exportDir = ExportPath;
     fs::create_directories(exportDir);
 
     std::string zipPath = (exportDir / (SanitizeFilename(presetName) + "_Preset.zip")).string();
@@ -178,7 +611,7 @@ void ExportPresetAsZip(const std::string& presetName) {
         return;
     }
 
-    std::string internalZipPath = std::format("SKSE/Plugins/NPC Replacer/Presets/{}.json", presetName);
+    std::string internalZipPath = std::format("Viny Mods/NPC Visual/Presets/{}.json", presetName);
 
     if (!mz_zip_writer_add_file(&zip_archive, internalZipPath.c_str(), sourcePath.c_str(), nullptr, 0, MZ_BEST_COMPRESSION)) {
         logger::error("Export: Failed to add file {} to ZIP", presetName);
@@ -195,15 +628,16 @@ void ExportPresetAsZip(const std::string& presetName) {
 void ExportNPCAsZip(RE::TESNPC* npc, const std::string& linkedPreset) {
     if (!npc) return;
     namespace fs = std::filesystem;
+    EnsureStorageDirectories();
 
     std::string editorID = clib_util::editorID::get_editorID(npc);
     if (editorID.empty()) editorID = std::format("{:08X}", npc->GetFormID());
-    std::string npcSourcePath = std::format("{}/{}.json", NPCPath, editorID);
+    std::string npcSourcePath = ResolveJsonPath(NPCPath, LegacyNPCPath, editorID).string();
 
     if (!fs::exists(npcSourcePath)) return;
 
-    // PONTO 4: Pasta padrão de exports
-    fs::path exportDir = "Data/Exports";
+    // PONTO 4: Pasta padr�o de exports
+    fs::path exportDir = ExportPath;
     fs::create_directories(exportDir);
 
     std::string npcName = npc->GetFullName() ? npc->GetFullName() : editorID;
@@ -218,14 +652,14 @@ void ExportNPCAsZip(RE::TESNPC* npc, const std::string& linkedPreset) {
     }
 
     // Adiciona o JSON do NPC no ZIP
-    std::string internalNpcPath = std::format("SKSE/Plugins/NPC Replacer/NPC/{}.json", editorID);
+    std::string internalNpcPath = std::format("Viny Mods/NPC Visual/NPC/{}.json", editorID);
     mz_zip_writer_add_file(&zip_archive, internalNpcPath.c_str(), npcSourcePath.c_str(), nullptr, 0, MZ_BEST_COMPRESSION);
 
     // PONTO 3: Se tiver um Preset linkado, exporta ele junto no mesmo ZIP
     if (!linkedPreset.empty()) {
-        std::string presetSourcePath = std::format("{}/{}.json", PresetsPath, linkedPreset);
+        std::string presetSourcePath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, linkedPreset).string();
         if (fs::exists(presetSourcePath)) {
-            std::string internalPresetPath = std::format("SKSE/Plugins/NPC Replacer/Presets/{}.json", linkedPreset);
+            std::string internalPresetPath = std::format("Viny Mods/NPC Visual/Presets/{}.json", linkedPreset);
             mz_zip_writer_add_file(&zip_archive, internalPresetPath.c_str(), presetSourcePath.c_str(), nullptr, 0, MZ_BEST_COMPRESSION);
         }
     }
@@ -233,6 +667,71 @@ void ExportNPCAsZip(RE::TESNPC* npc, const std::string& linkedPreset) {
     mz_zip_writer_finalize_archive(&zip_archive);
     mz_zip_writer_end(&zip_archive);
     logger::info("NPC '{}' successfully exported to: {}", editorID, zipPath);
+}
+
+static bool AddFileToZipOnce(mz_zip_archive& zip, std::set<std::string>& addedPaths, const std::filesystem::path& source, const std::string& internalPath)
+{
+    if (!std::filesystem::exists(source) || !addedPaths.insert(internalPath).second) {
+        return true;
+    }
+
+    if (!mz_zip_writer_add_file(&zip, internalPath.c_str(), source.string().c_str(), nullptr, 0, MZ_BEST_COMPRESSION)) {
+        logger::error("Export: Failed to add '{}' as '{}'", source.string(), internalPath);
+        return false;
+    }
+    return true;
+}
+
+static std::string ReadLinkedPresetName(const std::filesystem::path& npcJson)
+{
+    rapidjson::Document doc;
+    if (ReadJsonObjectFromFile(npcJson, doc, "ReadLinkedPresetName") &&
+        doc.HasMember("preset") && doc["preset"].IsString()) {
+        return doc["preset"].GetString();
+    }
+    return {};
+}
+
+static void ExportSelectedPackage(const std::string& packageName, const std::set<std::string>& presetNames, const std::set<std::string>& npcNames)
+{
+    EnsureStorageDirectories();
+    if (presetNames.empty() && npcNames.empty()) {
+        logger::warn("Export: no presets or NPCs selected.");
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    fs::create_directories(ExportPath);
+    const auto safeName = SanitizeFilename(packageName.empty() ? "NPCVisual_Export" : packageName);
+    const auto zipPath = (fs::path(ExportPath) / (safeName + ".zip")).string();
+
+    mz_zip_archive zip_archive;
+    memset(&zip_archive, 0, sizeof(zip_archive));
+    if (!mz_zip_writer_init_file(&zip_archive, zipPath.c_str(), 0)) {
+        logger::error("Export: Failed to initialize ZIP file at {}", zipPath);
+        return;
+    }
+
+    std::set<std::string> addedPaths;
+    std::set<std::string> presetsToExport = presetNames;
+
+    for (const auto& npcName : npcNames) {
+        const auto npcPath = ResolveJsonPath(NPCPath, LegacyNPCPath, npcName);
+        const auto linkedPreset = ReadLinkedPresetName(npcPath);
+        if (!linkedPreset.empty()) {
+            presetsToExport.insert(linkedPreset);
+        }
+        AddFileToZipOnce(zip_archive, addedPaths, npcPath, std::format("Viny Mods/NPC Visual/NPC/{}.json", npcName));
+    }
+
+    for (const auto& presetName : presetsToExport) {
+        AddFileToZipOnce(zip_archive, addedPaths, ResolveJsonPath(PresetsPath, LegacyPresetsPath, presetName),
+            std::format("Viny Mods/NPC Visual/Presets/{}.json", presetName));
+    }
+
+    mz_zip_writer_finalize_archive(&zip_archive);
+    mz_zip_writer_end(&zip_archive);
+    logger::info("Export package successfully written to: {}", zipPath);
 }
 
 bool IsHeadPartValid(RE::BGSHeadPart* hp, RE::TESRace* race, bool isFemale) {
@@ -244,38 +743,38 @@ bool IsHeadPartValid(RE::BGSHeadPart* hp, RE::TESRace* race, bool isFemale) {
     if (isFemale && hpMale && !hpFemale) return false;
     if (!isFemale && hpFemale && !hpMale) return false;
 
-    // 2. Checa a Raça
+    // 2. Checa a Ra�a
     if (race) {
-        // Se a propriedade validRaces for nula, a peça é válida para todas as raças.
+        // Se a propriedade validRaces for nula, a pe�a � v�lida para todas as ra�as.
         if (!hp->validRaces) {
             return true;
         }
 
-        // Verifica se a raça do NPC está explicitamente na lista
+        // Verifica se a ra�a do NPC est� explicitamente na lista
         if (hp->validRaces->HasForm(race)) {
             return true;
         }
 
-        // FALLBACK: Raças derivadas (ex: Vampiros)
+        // FALLBACK: Ra�as derivadas (ex: Vampiros)
         // O Skyrim usa a armorParentRace (ex: NordRaceVampire -> NordRace) para herdar HeadParts.
         if (race->armorParentRace && hp->validRaces->HasForm(race->armorParentRace)) {
             return true;
         }
 
-        // EXCEÇÃO: Se a lista existe, mas o criador do mod deixou ela vazia.
-        // Assumimos que a intenção era ser válida para todas as raças.
+        // EXCE��O: Se a lista existe, mas o criador do mod deixou ela vazia.
+        // Assumimos que a inten��o era ser v�lida para todas as ra�as.
         if (hp->validRaces->forms.empty()) {
             return true;
         }
 
-        // Se chegou aqui, a raça (ou a raça base) realmente não tem permissão para usar esta peça.
+        // Se chegou aqui, a ra�a (ou a ra�a base) realmente n�o tem permiss�o para usar esta pe�a.
         return false;
     }
 
     return true;
 }
 
-// Função auxiliar para listar as raças permitidas de uma HeadPart em formato de texto
+// Fun��o auxiliar para listar as ra�as permitidas de uma HeadPart em formato de texto
 std::string GetValidRacesString(RE::BGSHeadPart* hp) {
     if (!hp || !hp->validRaces || hp->validRaces->forms.empty()) return "Any";
 
@@ -288,12 +787,12 @@ std::string GetValidRacesString(RE::BGSHeadPart* hp) {
         }
     }
     if (!races.empty()) {
-        races.pop_back(); races.pop_back(); // Remove a última vírgula e espaço
+        races.pop_back(); races.pop_back(); // Remove a �ltima v�rgula e espa�o
     }
     return races;
 }
 
-// Função Auxiliar para descobrir o que o Index do Tint significa baseado na Raça e Sexo
+// Fun��o Auxiliar para descobrir o que o Index do Tint significa baseado na Ra�a e Sexo
 std::string GetSkinToneName(RE::TESRace* race, RE::SEX sex, uint16_t index) {
     if (!race) return "Unknown";
 
@@ -359,13 +858,14 @@ static bool openPresetSelectModal = false;
 void RefreshAvailablePresets() {
     scannedPresets.clear();
     ui_availablePresets.clear();
-    std::filesystem::create_directories(PresetsPath);
+    EnsureStorageDirectories();
 
-    for (const auto& entry : std::filesystem::directory_iterator(PresetsPath)) {
+    for (const auto& presetPath : CollectJsonFiles(PresetsPath, LegacyPresetsPath)) {
+        std::filesystem::directory_entry entry(presetPath);
         if (entry.path().extension() == ".json") {
             CustomPresetInfo info;
             info.name = entry.path().stem().string();
-            ui_availablePresets.push_back(info.name); // Mantém compatibilidade com funções antigas
+            ui_availablePresets.push_back(info.name); // Mant�m compatibilidade com fun��es antigas
 
             std::filesystem::path pngPath = entry.path();
             pngPath.replace_extension(".png");
@@ -399,15 +899,15 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     bodyTint.AddMember("a", static_cast<int>(ui_bodyColor[3] * 255.0f), allocator);
     doc.AddMember("bodyTintColor", bodyTint, allocator);
 
-    if (ui_race) doc.AddMember("race", rapidjson::Value(FormUtil::NormalizeFormID(ui_race).c_str(), allocator), allocator);
-    if (ui_skin) doc.AddMember("skin", rapidjson::Value(FormUtil::NormalizeFormID(ui_skin).c_str(), allocator), allocator);
-    if (ui_outfit) doc.AddMember("defaultOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_outfit).c_str(), allocator), allocator);
-    else doc.AddMember("defaultOutfit", "", allocator); 
-    if (ui_sleepOutfit) doc.AddMember("sleepOutfit", rapidjson::Value(FormUtil::NormalizeFormID(ui_sleepOutfit).c_str(), allocator), allocator);
-    else doc.AddMember("sleepOutfit", "", allocator); 
-    /*if (ui_voice) doc.AddMember("voice", rapidjson::Value(FormUtil::NormalizeFormID(ui_voice).c_str(), allocator), allocator);
+    if (ui_race) doc.AddMember("race", FormUtil::MakeFormRef(ui_race, allocator), allocator);
+    if (ui_skin) doc.AddMember("skin", FormUtil::MakeFormRef(ui_skin, allocator), allocator);
+    if (ui_outfit) doc.AddMember("defaultOutfit", FormUtil::MakeFormRef(ui_outfit, allocator), allocator);
+    else doc.AddMember("defaultOutfit", "", allocator);
+    if (ui_sleepOutfit) doc.AddMember("sleepOutfit", FormUtil::MakeFormRef(ui_sleepOutfit, allocator), allocator);
+    else doc.AddMember("sleepOutfit", "", allocator);
+    /*if (ui_voice) doc.AddMember("voice", FormUtil::MakeFormRef(ui_voice, allocator), allocator);
     else doc.AddMember("voice", "", allocator); */
-    if (ui_hairColor) doc.AddMember("hairColor", rapidjson::Value(FormUtil::NormalizeFormID(ui_hairColor).c_str(), allocator), allocator);
+    if (ui_hairColor) doc.AddMember("hairColor", FormUtil::MakeFormRef(ui_hairColor, allocator), allocator);
     if (!ui_customFaceNif.empty()) {
         doc.AddMember("customFaceNif", rapidjson::Value(ui_customFaceNif.c_str(), allocator), allocator);
     }
@@ -415,8 +915,7 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     rapidjson::Value hpArray(rapidjson::kArrayType);
     for (auto* hp : ui_headParts) {
         if (!hp) continue;
-        std::string hpStr = FormUtil::NormalizeFormID(hp);
-        hpArray.PushBack(rapidjson::Value(hpStr.c_str(), allocator), allocator);
+        hpArray.PushBack(FormUtil::MakeFormRef(hp, allocator), allocator);
     }
     doc.AddMember("headParts", hpArray, allocator);
 
@@ -472,7 +971,7 @@ bool HasUnsavedChanges() {
 }
 
 void ParseJSONToUI(const rapidjson::Document& j) {
-    // Limpa os dados de ponteiro primeiro para evitar lixo de memória / estado anterior
+    // Limpa os dados de ponteiro primeiro para evitar lixo de memoria / estado anterior.
     ui_race = nullptr;
     ui_skin = nullptr;
     ui_outfit = nullptr;
@@ -480,30 +979,45 @@ void ParseJSONToUI(const rapidjson::Document& j) {
     ui_hairColor = nullptr;
     ui_voice = nullptr;
     ui_customFaceNif = "";
-    if (j.HasMember("height") && j["height"].IsFloat()) ui_height = j["height"].GetFloat();
-    if (j.HasMember("weight") && j["weight"].IsFloat()) ui_weight = j["weight"].GetFloat(); 
+
+    auto getFloat = [](const rapidjson::Value& obj, const char* key, float fallback) {
+        return obj.IsObject() && obj.HasMember(key) && obj[key].IsNumber() ? obj[key].GetFloat() : fallback;
+        };
+    auto getInt = [](const rapidjson::Value& obj, const char* key, int fallback) {
+        return obj.IsObject() && obj.HasMember(key) && obj[key].IsNumber() ? obj[key].GetInt() : fallback;
+        };
+
+    if (!j.IsObject()) {
+        return;
+    }
+
+    if (j.HasMember("height") && j["height"].IsNumber()) ui_height = j["height"].GetFloat();
+    if (j.HasMember("weight") && j["weight"].IsNumber()) ui_weight = j["weight"].GetFloat();
     if (j.HasMember("isFemale") && j["isFemale"].IsBool()) ui_isFemale = j["isFemale"].GetBool();
     if (j.HasMember("oppositeGenderAnim") && j["oppositeGenderAnim"].IsBool()) ui_oppositeGenderAnim = j["oppositeGenderAnim"].GetBool();
 
-    if (j.HasMember("bodyTintColor")) {
-        auto& c = j["bodyTintColor"];
-        ui_bodyColor[0] = (c.HasMember("r") ? c["r"].GetInt() : 255) / 255.0f;
-        ui_bodyColor[1] = (c.HasMember("g") ? c["g"].GetInt() : 255) / 255.0f;
-        ui_bodyColor[2] = (c.HasMember("b") ? c["b"].GetInt() : 255) / 255.0f;
-        ui_bodyColor[3] = (c.HasMember("a") ? c["a"].GetInt() : 0) / 255.0f;
+    if (j.HasMember("bodyTintColor") && j["bodyTintColor"].IsObject()) {
+        const auto& c = j["bodyTintColor"];
+        ui_bodyColor[0] = getInt(c, "r", 255) / 255.0f;
+        ui_bodyColor[1] = getInt(c, "g", 255) / 255.0f;
+        ui_bodyColor[2] = getInt(c, "b", 255) / 255.0f;
+        ui_bodyColor[3] = getInt(c, "a", 0) / 255.0f;
     }
 
-    if (j.HasMember("race")) ui_race = RE::TESForm::LookupByID<RE::TESRace>(FormUtil::FormIDFromString(j["race"].GetString()));
-    if (j.HasMember("skin")) ui_skin = RE::TESForm::LookupByID<RE::TESObjectARMO>(FormUtil::FormIDFromString(j["skin"].GetString()));
-    if (j.HasMember("defaultOutfit")) ui_outfit = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(j["defaultOutfit"].GetString()));
-    if (j.HasMember("sleepOutfit")) ui_sleepOutfit = RE::TESForm::LookupByID<RE::BGSOutfit>(FormUtil::FormIDFromString(j["sleepOutfit"].GetString()));
-    if (j.HasMember("voice")) ui_voice = RE::TESForm::LookupByID<RE::BGSVoiceType>(FormUtil::FormIDFromString(j["voice"].GetString()));
-    if (j.HasMember("hairColor")) ui_hairColor = RE::TESForm::LookupByID<RE::BGSColorForm>(FormUtil::FormIDFromString(j["hairColor"].GetString()));
+    if (j.HasMember("race") && j["race"].IsString()) ui_race = FormUtil::ResolveForm<RE::TESRace>(j["race"]);
+    if (j.HasMember("skin") && j["skin"].IsString()) ui_skin = FormUtil::ResolveForm<RE::TESObjectARMO>(j["skin"]);
+    if (j.HasMember("defaultOutfit") && j["defaultOutfit"].IsString()) ui_outfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["defaultOutfit"]);
+    if (j.HasMember("sleepOutfit") && j["sleepOutfit"].IsString()) ui_sleepOutfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["sleepOutfit"]);
+    if (j.HasMember("voice") && j["voice"].IsString()) ui_voice = FormUtil::ResolveForm<RE::BGSVoiceType>(j["voice"]);
+    if (j.HasMember("hairColor") && j["hairColor"].IsString()) ui_hairColor = FormUtil::ResolveForm<RE::BGSColorForm>(j["hairColor"]);
 
     ui_headParts.clear();
     if (j.HasMember("headParts") && j["headParts"].IsArray()) {
-        for (auto& hpJson : j["headParts"].GetArray()) {
-            if (auto hp = RE::TESForm::LookupByID<RE::BGSHeadPart>(FormUtil::FormIDFromString(hpJson.GetString()))) {
+        for (const auto& hpJson : j["headParts"].GetArray()) {
+            if (!hpJson.IsString()) {
+                continue;
+            }
+            if (auto hp = FormUtil::ResolveForm<RE::BGSHeadPart>(hpJson)) {
                 ui_headParts.push_back(hp);
             }
         }
@@ -511,29 +1025,50 @@ void ParseJSONToUI(const rapidjson::Document& j) {
 
     ui_tintLayers.clear();
     if (j.HasMember("tintLayers") && j["tintLayers"].IsArray()) {
-        for (auto& l : j["tintLayers"].GetArray()) {
-            UITintLayer tl;
+        for (const auto& l : j["tintLayers"].GetArray()) {
+            if (!l.IsObject() || !l.HasMember("index") || !l["index"].IsNumber()) {
+                continue;
+            }
+
+            UITintLayer tl{};
             tl.index = static_cast<uint16_t>(l["index"].GetInt());
             tl.name = GetSkinToneName(ui_race, ui_isFemale ? RE::SEX::kFemale : RE::SEX::kMale, tl.index);
-            auto& colorObj = l["color"];
-            tl.color[0] = (colorObj.HasMember("r") ? colorObj["r"].GetInt() : 0) / 255.0f;
-            tl.color[1] = (colorObj.HasMember("g") ? colorObj["g"].GetInt() : 0) / 255.0f;
-            tl.color[2] = (colorObj.HasMember("b") ? colorObj["b"].GetInt() : 0) / 255.0f;
-            tl.color[3] = (colorObj.HasMember("a") ? colorObj["a"].GetInt() : 255) / 255.0f;
-            tl.interpolation = l["interpolation"].GetFloat();
-            tl.preset = static_cast<uint16_t>(l["preset"].GetInt());
+
+            if (l.HasMember("color") && l["color"].IsObject()) {
+                const auto& colorObj = l["color"];
+                tl.color[0] = getInt(colorObj, "r", 0) / 255.0f;
+                tl.color[1] = getInt(colorObj, "g", 0) / 255.0f;
+                tl.color[2] = getInt(colorObj, "b", 0) / 255.0f;
+                tl.color[3] = getInt(colorObj, "a", 255) / 255.0f;
+            }
+            else {
+                tl.color[0] = 0.0f;
+                tl.color[1] = 0.0f;
+                tl.color[2] = 0.0f;
+                tl.color[3] = 1.0f;
+            }
+
+            tl.interpolation = getFloat(l, "interpolation", 1.0f);
+            tl.preset = static_cast<uint16_t>(getInt(l, "preset", 0));
             ui_tintLayers.push_back(tl);
         }
     }
 
     if (j.HasMember("faceMorphs") && j["faceMorphs"].IsArray()) {
-        auto mArray = j["faceMorphs"].GetArray();
-        for (rapidjson::SizeType i = 0; i < mArray.Size() && i < 19; i++) ui_morphs[i] = mArray[i].GetFloat();
+        for (int i = 0; i < 19; i++) {
+            ui_morphs[i] = 3.402823466e+38f;
+        }
+        const auto mArray = j["faceMorphs"].GetArray();
+        for (rapidjson::SizeType i = 0; i < mArray.Size() && i < 19; i++) {
+            if (mArray[i].IsNumber()) {
+                ui_morphs[i] = mArray[i].GetFloat();
+            }
+        }
     }
     else {
-        // Inicializa com o valor máximo indicando que está desabilitado
         for (int i = 0; i < 19; i++) ui_morphs[i] = 3.402823466e+38f;
     }
+
     if (j.HasMember("customFaceNif") && j["customFaceNif"].IsString()) {
         ui_customFaceNif = j["customFaceNif"].GetString();
     }
@@ -574,7 +1109,7 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
 
     ImGuiMCP::PushID(label);
 
-    // CORREÇÃO 2: Pega o Label, acha o "##" e oculta o ID da frente do texto visual
+    // CORRE��O 2: Pega o Label, acha o "##" e oculta o ID da frente do texto visual
     std::string displayLabel = label;
     size_t hashPos = displayLabel.find("##");
     if (hashPos != std::string::npos) {
@@ -593,7 +1128,7 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
         const char* previewValue = comboItems.empty() ? "None" : comboItems[localSelection];
 
         if (ImGuiMCP::BeginCombo("##drop", previewValue)) {
-            // PONTO 4: Campo de pesquisa dinâmico para os itens do dropdown
+            // PONTO 4: Campo de pesquisa din�mico para os itens do dropdown
             static std::map<std::string, std::string> searchBuffers;
             char searchBuf[256] = "";
             if (searchBuffers.contains(label)) strcpy_s(searchBuf, searchBuffers[label].c_str());
@@ -613,7 +1148,7 @@ void DrawDropdown(const char* label, const std::string& category, T** formPtr, i
                 std::string itemLower = itemStr;
                 std::transform(itemLower.begin(), itemLower.end(), itemLower.begin(), [](unsigned char c) { return std::tolower(c); });
 
-                // Mostra apenas itens que contém o que foi digitado
+                // Mostra apenas itens que cont�m o que foi digitado
                 if (searchStr.empty() || itemLower.find(searchStr) != std::string::npos) {
                     bool isSelected = (localSelection == i);
                     if (ImGuiMCP::Selectable(comboItems[i], isSelected)) {
@@ -638,15 +1173,9 @@ void LoadPresetToUI(const std::string& presetName) {
     activePresetName = presetName;
     ui_linkedPreset = "";
 
-    std::string path = std::format("{}/{}.json", PresetsPath, presetName);
-    FILE* fp = nullptr;
-    fopen_s(&fp, path.c_str(), "rb");
-    if (fp) {
-        char readBuffer[65536];
-        rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-        rapidjson::Document doc;
-        doc.ParseStream(is);
-        fclose(fp);
+    std::string path = ResolveJsonPath(PresetsPath, LegacyPresetsPath, presetName).string();
+    rapidjson::Document doc;
+    if (ReadJsonObjectFromFile(path, doc, "UI/LoadPreset")) {
         ParseJSONToUI(doc);
         logger::info("Preset {} loaded into UI.", presetName);
     }
@@ -668,6 +1197,8 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     }
 
     if (!g_currentNPC) return;
+
+    Manager::DumpFaceDiagnostics(g_currentActor, g_currentNPC, "UI LoadNPCToUI");
 
     if (!g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
         std::string vanillaStr;
@@ -699,7 +1230,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
 
     ui_headParts.clear();
 
-    //Mapeia todas as "Extra Parts" que pertencem a alguma peça principal que o NPC tem equipada.
+    //Mapeia todas as "Extra Parts" que pertencem a alguma pe�a principal que o NPC tem equipada.
     std::set<RE::BGSHeadPart*> ownedExtraParts;
     if (g_currentNPC->headParts) {
         for (int i = 0; i < g_currentNPC->numHeadParts; i++) {
@@ -712,12 +1243,12 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
         }
     }
 
-    // Adiciona à UI apenas as peças que NÃO são "filhas" de outra peça já equipada.
+    // Adiciona � UI apenas as pe�as que N�O s�o "filhas" de outra pe�a j� equipada.
     for (int i = 0; i < g_currentNPC->numHeadParts; i++) {
         if (g_currentNPC->headParts && g_currentNPC->headParts[i]) {
             auto hp = g_currentNPC->headParts[i];
 
-            // Se esta headpart NÃO estiver na lista de filhas ownedExtraParts, mostramos na UI.
+            // Se esta headpart N�O estiver na lista de filhas ownedExtraParts, mostramos na UI.
             if (ownedExtraParts.find(hp) == ownedExtraParts.end()) {
                 ui_headParts.push_back(hp);
             }
@@ -752,7 +1283,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
 
     std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
     if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
-    std::string filePath = std::format("{}/{}.json", NPCPath, editorID);
+    std::string filePath = ResolveJsonPath(NPCPath, LegacyNPCPath, editorID).string();
 
     if (std::filesystem::exists(filePath)) {
         FILE* fp = nullptr;
@@ -765,7 +1296,35 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
             fclose(fp);
             if (doc.IsObject() && doc.HasMember("preset") && doc["preset"].IsString()) {
                 ui_linkedPreset = doc["preset"].GetString();
+                std::string presetPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, ui_linkedPreset).string();
+                FILE* presetFp = nullptr;
+                fopen_s(&presetFp, presetPath.c_str(), "rb");
+                if (presetFp) {
+                    char presetReadBuffer[65536];
+                    rapidjson::FileReadStream presetStream(presetFp, presetReadBuffer, sizeof(presetReadBuffer));
+                    rapidjson::Document presetDoc;
+                    presetDoc.ParseStream(presetStream);
+                    fclose(presetFp);
+                    if (presetDoc.IsObject() && presetDoc.HasMember("customFaceNif") && presetDoc["customFaceNif"].IsString()) {
+                        ui_customFaceNif = presetDoc["customFaceNif"].GetString();
+                    }
+                }
             }
+            else if (doc.IsObject() && doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
+                ui_customFaceNif = doc["customFaceNif"].GetString();
+            }
+        }
+    }
+
+    if (ui_customFaceNif.empty()) {
+        if (needFaceScan) {
+            ScanFaceGeom();
+        }
+        ui_customFaceNif = ResolveDefaultFaceGeomPath(g_currentNPC);
+        if (!ui_customFaceNif.empty()) {
+            logger::debug("[UI LoadNPCToUI] FaceGeom padrao resolvida para NPC {:08X}: '{}'",
+                g_currentNPC->GetFormID(),
+                ui_customFaceNif);
         }
     }
 
@@ -773,15 +1332,21 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
 }
 
 void SaveData() {
+    EnsureStorageDirectories();
     rapidjson::Document doc;
     auto& allocator = doc.GetAllocator();
     doc.SetObject();
 
     std::string finalPath;
+    std::string savedName;
+    std::string savedFolder;
+    std::string savedLegacyFolder;
 
     if (isEditingPreset) {
         GenerateJSONFromUI(doc);
-        std::filesystem::create_directories(PresetsPath);
+        savedName = activePresetName;
+        savedFolder = PresetsPath;
+        savedLegacyFolder = LegacyPresetsPath;
         finalPath = std::format("{}/{}.json", PresetsPath, activePresetName);
     }
     else {
@@ -794,10 +1359,13 @@ void SaveData() {
         }
         std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
         if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
-        std::filesystem::create_directories(NPCPath);
+        savedName = editorID;
+        savedFolder = NPCPath;
+        savedLegacyFolder = LegacyNPCPath;
         finalPath = std::format("{}/{}.json", NPCPath, editorID);
     }
 
+    bool savedOk = false;
     FILE* fp = nullptr;
     fopen_s(&fp, finalPath.c_str(), "wb");
     if (fp) {
@@ -806,56 +1374,57 @@ void SaveData() {
         rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(os);
         doc.Accept(writer);
         fclose(fp);
+        savedOk = true;
         logger::info("Data saved to {}", finalPath);
+    }
+    else {
+        logger::error("Failed to save data to {}", finalPath);
+    }
+
+    if (savedOk && !savedName.empty()) {
+        // A migracao legacy -> pasta nova acontece aqui, e apenas aqui,
+        // depois de uma gravacao bem-sucedida.
+        FinalizeLegacyMigrationAfterSave(savedFolder, savedLegacyFolder, savedName);
     }
 
     if (isEditingPreset && !activePresetName.empty()) {
-        if (std::filesystem::exists(NPCPath)) {
-            for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
-                if (entry.path().extension() == ".json") {
-                    FILE* nFp = nullptr;
-                    fopen_s(&nFp, entry.path().string().c_str(), "rb");
-                    if (nFp) {
-                        char readBuffer[2048];
-                        rapidjson::FileReadStream is(nFp, readBuffer, sizeof(readBuffer));
-                        rapidjson::Document npcDoc;
-                        npcDoc.ParseStream(is);
-                        fclose(nFp);
+        for (const auto& npcJson : CollectJsonFiles(NPCPath, LegacyNPCPath)) {
+            std::filesystem::directory_entry entry(npcJson);
+            if (entry.path().extension() == ".json") {
+                rapidjson::Document npcDoc;
+                if (ReadJsonObjectFromFile(entry.path(), npcDoc, "SaveData/PresetUsers") &&
+                    npcDoc.HasMember("preset") && npcDoc["preset"].IsString() &&
+                    npcDoc["preset"].GetString() == activePresetName) {
 
-                        if (npcDoc.IsObject() && npcDoc.HasMember("preset") && npcDoc["preset"].IsString()) {
-                            if (npcDoc["preset"].GetString() == activePresetName) {
+                    std::string filename = entry.path().stem().string();
+                    RE::TESNPC* targetNPC = nullptr;
 
-                                std::string filename = entry.path().stem().string();
-                                RE::TESNPC* targetNPC = nullptr;
+                    if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
+                        targetNPC = edidForm->As<RE::TESNPC>();
+                    }
+                    else {
+                        try {
+                            RE::FormID id = std::stoul(filename, nullptr, 16);
+                            if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
+                        }
+                        catch (...) {}
+                    }
 
-                                if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
-                                    targetNPC = edidForm->As<RE::TESNPC>();
-                                }
-                                else {
-                                    try {
-                                        RE::FormID id = std::stoul(filename, nullptr, 16);
-                                        if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
-                                    }
-                                    catch (...) {}
-                                }
+                    if (targetNPC) {
+                        rapidjson::Document safeDoc = BuildSafeCustomizationDocument(targetNPC, doc);
+                        Manager::ApplyNPCCustomizationFromJSON(targetNPC, safeDoc);
+                        logger::info("Updated NPC base {} with modified preset '{}'", filename, activePresetName);
 
-                                if (targetNPC) {
-                                    Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
-                                    logger::info("Updated NPC base {} with modified preset '{}'", filename, activePresetName);
-
-                                    auto processLists = RE::ProcessLists::GetSingleton();
-                                    if (processLists) {
-                                        for (auto& actorHandle : processLists->highActorHandles) {
-                                            auto ref = actorHandle.get();
-                                            if (ref) {
-                                                if (auto actor = ref->As<RE::Actor>()) {
-                                                    if (!actor->IsPlayerRef() && actor->GetActorBase() == targetNPC) {
-                                                        actor->UpdateHairColor();
-                                                        actor->UpdateSkinColor();
-                                                        //actor->DoReset3D(true);
-                                                    }
-                                                }
-                                            }
+                        auto processLists = RE::ProcessLists::GetSingleton();
+                        if (processLists) {
+                            for (auto& actorHandle : processLists->highActorHandles) {
+                                auto ref = actorHandle.get();
+                                if (ref) {
+                                    if (auto actor = ref->As<RE::Actor>()) {
+                                        if (!actor->IsPlayerRef() && actor->GetActorBase() == targetNPC) {
+                                            actor->UpdateHairColor();
+                                            actor->UpdateSkinColor();
+                                            //actor->DoReset3D(true);
                                         }
                                     }
                                 }
@@ -872,45 +1441,87 @@ void SaveData() {
 
 void ApplyNPC(bool force3DReset = true) {
     if (!g_currentNPC) return;
-    logger::info("[UI] Botão Apply pressionado para {:08X}", g_currentNPC->GetFormID());
+    logger::debug("[UI Apply] === BEGIN npc={:08X} npcPtr={:X} actorPtr={:X} force3DReset={} linkedPreset='{}' ===",
+        g_currentNPC->GetFormID(),
+        reinterpret_cast<std::uintptr_t>(g_currentNPC),
+        reinterpret_cast<std::uintptr_t>(g_currentActor),
+        force3DReset,
+        ui_linkedPreset);
     rapidjson::Document doc;
 
     if (!ui_linkedPreset.empty()) {
-        std::string pPath = std::format("{}/{}.json", PresetsPath, ui_linkedPreset);
-        FILE* fp = nullptr;
-        fopen_s(&fp, pPath.c_str(), "rb");
-        if (fp) {
-            char readBuffer[65536];
-            rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-            doc.ParseStream(is);
-            fclose(fp);
+        std::string pPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, ui_linkedPreset).string();
+        logger::debug("[UI Apply] Carregando preset linkado '{}': {}", ui_linkedPreset, pPath);
+        rapidjson::Document loadedPreset;
+        if (ReadJsonObjectFromFile(pPath, loadedPreset, "UI/ApplyPreset")) {
+            doc = BuildSafeCustomizationDocument(g_currentNPC, loadedPreset);
+            logger::debug("[UI Apply] Preset parse OK: isObject={} parseError={} members={}",
+                doc.IsObject(),
+                doc.HasParseError(),
+                doc.IsObject() ? doc.MemberCount() : 0);
+        }
+        else {
+            logger::error("[UI Apply] Falha ao abrir preset linkado: {}", pPath);
+            doc.SetObject();
         }
     }
     else {
+        logger::debug("[UI Apply] Gerando JSON a partir da UI...");
         GenerateJSONFromUI(doc);
+        logger::debug("[UI Apply] JSON UI gerado: isObject={} members={}", doc.IsObject(), doc.IsObject() ? doc.MemberCount() : 0);
     }
-    logger::info("[UI] Chamando Manager::ApplyNPCCustomizationFromJSON...");
+    logger::debug("[UI Apply] Chamando Manager::ApplyNPCCustomizationFromJSON...");
     Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
+    logger::debug("[UI Apply] ApplyNPCCustomizationFromJSON retornou para npc={:08X}.", g_currentNPC->GetFormID());
 
 
     std::string nifToApply = "";
     if (doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
         nifToApply = doc["customFaceNif"].GetString();
     }
+    logger::debug("[UI Apply] customFaceNif resolvido: '{}'", nifToApply);
 
-    Manager::GetSingleton()->RegisterAffectedNPC(g_currentNPC->GetFormID(), nifToApply);
+    if (!nifToApply.empty()) {
+        Manager::GetSingleton()->RegisterAffectedNPC(g_currentNPC->GetFormID(), nifToApply);
+        logger::debug("[UI Apply] RegisterAffectedNPC retornou para base={:08X}.", g_currentNPC->GetFormID());
+    }
+    else {
+        Manager::GetSingleton()->UnregisterAffectedNPC(g_currentNPC->GetFormID());
+        logger::debug("[UI Apply] customFaceNif vazio; AffectedNPC removido para base={:08X}.", g_currentNPC->GetFormID());
+    }
 
     if (force3DReset) {
 
         if (g_currentActor) {
+            logger::debug("[UI Apply] Actor runtime antes do reset: actor={:08X} actorPtr={:X} loaded={} actor3D={:X} faceNode={:X}",
+                g_currentActor->GetFormID(),
+                reinterpret_cast<std::uintptr_t>(g_currentActor),
+                g_currentActor->Is3DLoaded(),
+                reinterpret_cast<std::uintptr_t>(g_currentActor->Get3D(false)),
+                reinterpret_cast<std::uintptr_t>(g_currentActor->GetFaceNodeSkinned()));
+            logger::debug("[UI Apply] Calling UpdateHairColor...");
             g_currentActor->UpdateHairColor();
+            logger::debug("[UI Apply] UpdateHairColor OK. Calling UpdateSkinColor...");
             g_currentActor->UpdateSkinColor();
+            logger::debug("[UI Apply] UpdateSkinColor OK. Calling DoReset3D(true)...");
             g_currentActor->DoReset3D(true);
+            logger::debug("[UI Apply] DoReset3D(true) retornou actor={:08X} loaded={} actor3D={:X}",
+                g_currentActor->GetFormID(),
+                g_currentActor->Is3DLoaded(),
+                reinterpret_cast<std::uintptr_t>(g_currentActor->Get3D(false)));
 
             // 3. SCHEDULER: Queue deformation 500ms after Reset3D
             if (!nifToApply.empty()) {
+                logger::debug("[UI Apply] Agendando ScheduleFaceDeform actor={:08X} nif='{}'", g_currentActor->GetFormID(), nifToApply);
                 Manager::ScheduleFaceDeform(g_currentActor->GetFormID(), nifToApply);
+                logger::debug("[UI Apply] ScheduleFaceDeform retornou actor={:08X}.", g_currentActor->GetFormID());
             }
+            else {
+                logger::debug("[UI Apply] Nenhuma customFaceNif; deformacao nao agendada.");
+            }
+        }
+        else {
+            logger::warn("[UI Apply] force3DReset ativo, mas g_currentActor null.");
         }
 
         //auto processLists = RE::ProcessLists::GetSingleton();
@@ -934,9 +1545,14 @@ void ApplyNPC(bool force3DReset = true) {
         //    }
         //}
     }
+    else {
+        logger::debug("[UI Apply] force3DReset=false; reset/deformacao nao executados.");
+    }
+
+    logger::debug("[UI Apply] === END npc={:08X} ===", g_currentNPC->GetFormID());
 }
 
-// Botão "Voltar ao Padrão"
+// Bot�o "Voltar ao Padr�o"
 void RevertNPC() {
     if (!g_currentNPC || !originalEngineState.IsObject()) return;
 
@@ -944,7 +1560,7 @@ void RevertNPC() {
     ui_linkedPreset = "";
     Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, originalEngineState);
 
-    // Recarrega a UI baseada na engine recém-restaurada
+    // Recarrega a UI baseada na engine rec�m-restaurada
     LoadNPCToUI(g_currentNPC, g_currentActor);
 
     if (g_currentActor) {
@@ -959,33 +1575,29 @@ void RevertNPC() {
 void RestoreDefaultNPC() {
     if (!g_currentNPC) return;
 
-    // 1. Apaga o ficheiro JSON que define as alterações customizadas deste NPC
+    // 1. Apaga o ficheiro JSON que define as altera��es customizadas deste NPC
     std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
     if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
-    std::string filePath = std::format("{}/{}.json", NPCPath, editorID);
-
-    if (std::filesystem::exists(filePath)) {
-        std::filesystem::remove(filePath);
-    }
+    RemoveJsonInBothLocations(NPCPath, LegacyNPCPath, editorID);
 
     ui_linkedPreset = "";
     ui_customFaceNif = "";
 
-    // 2. Aplica o estado LIMPO E ORIGINAL à memória (Se estiver no Cofre global)
+    // 2. Aplica o estado LIMPO E ORIGINAL � mem�ria (Se estiver no Cofre global)
     if (g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
         rapidjson::Document doc;
         doc.Parse(g_vanillaNPCStates[g_currentNPC->GetFormID()].c_str());
         Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, doc);
     }
     else {
-        // Fallback de segurança 
+        // Fallback de seguran�a 
         Manager::ApplyNPCCustomizationFromJSON(g_currentNPC, originalEngineState);
     }
 
     // 3. Atualiza a UI para refletir os valores base restaurados
     LoadNPCToUI(g_currentNPC, g_currentActor);
     Manager::GetSingleton()->UnregisterAffectedNPC(g_currentNPC->GetFormID());
-    // 4. Dá reset ao modelo 3D do personagem no mapa
+    // 4. D� reset ao modelo 3D do personagem no mapa
     if (g_currentActor) {
         g_currentActor->UpdateSkinColor();
         g_currentActor->UpdateHairColor();
@@ -994,17 +1606,6 @@ void RestoreDefaultNPC() {
     }
     logger::info("Restored {} to absolute default (JSON deleted and Base Form reverted).", editorID);
 }
-
-struct CustomFaceInfo {
-    std::string nifPath;     
-    std::string displayPath; 
-    std::string displayName;
-    RE::FormID originFormID;
-    void* textureID;
-};
-static std::vector<CustomFaceInfo> scannedFaces;
-static bool needFaceScan = true;
-static bool openFaceSelectModal = false;
 
 void ScanFaceGeom() {
     scannedFaces.clear();
@@ -1018,9 +1619,9 @@ void ScanFaceGeom() {
         return;
     }
 
-    logger::info("[ScanFaceGeom] Starting FaceGeom scan...");
+    logger::debug("[ScanFaceGeom] Starting FaceGeom scan...");
 
-    // Adiciona flag para pular arquivos/pastas sem permissão
+    // Adiciona flag para pular arquivos/pastas sem permiss�o
     auto options = std::filesystem::directory_options::skip_permission_denied;
 
     for (auto it = std::filesystem::recursive_directory_iterator(geomPath, options, ec);
@@ -1036,11 +1637,11 @@ void ScanFaceGeom() {
             CustomFaceInfo info;
 
             try {
-                // A conversão .string() foi movida para DENTRO do try. 
+                // A convers�o .string() foi movida para DENTRO do try. 
                 // Evita o crash "No mapping for the Unicode character"
                 std::string fullPath = it->path().string();
 
-                // Log detalhado para rastrear onde o scanner está (pode mudar para logger::info se preferir)
+                // Log detalhado para rastrear onde o scanner est� (pode mudar para logger::info se preferir)
                 logger::debug("[ScanFaceGeom] Analyzing NIF: {}", fullPath);
 
                 std::string normalizedPath = fullPath;
@@ -1060,14 +1661,14 @@ void ScanFaceGeom() {
                     info.displayPath = info.nifPath;
                 }
 
-                // 3. Resolução do Nome
+                // 3. Resolu��o do Nome
                 std::string stem = it->path().stem().string();
                 std::string pluginFolder = it->path().parent_path().filename().string();
 
                 info.originFormID = 0;
 
                 // --- CHECAGEM ESTRITA DE HEXADECIMAL ---
-                // Verifica se o nome é 100% FormID. Evita que nomes como "bela_rosto" 
+                // Verifica se o nome � 100% FormID. Evita que nomes como "bela_rosto" 
                 // sejam lidos parcialmente como hex (0xBE).
                 bool isStrictHex = true;
                 if (stem.empty() || stem.length() > 8) {
@@ -1083,7 +1684,7 @@ void ScanFaceGeom() {
                 }
 
                 if (isStrictHex) {
-                    // É um FormID de NPC
+                    // � um FormID de NPC
                     uint32_t rawID = std::stoul(stem, nullptr, 16);
                     auto dataHandler = RE::TESDataHandler::GetSingleton();
 
@@ -1109,12 +1710,12 @@ void ScanFaceGeom() {
                         info.displayName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", info.originFormID);
                     }
                     else {
-                        info.displayName = std::format("Unknown [{:08X}]", info.originFormID);
+                        info.displayName = std::format("{} [{:08X}]", pluginFolder.empty() ? "FaceGeom" : pluginFolder, info.originFormID);
                     }
                 }
                 else {
-                    // É UM ARQUIVO COM NOME CUSTOMIZADO (Ex: "Rosto_da_Lydia")
-                    logger::info("[ScanFaceGeom] Custom Face detected (Non-FormID): {}", stem);
+                    // � UM ARQUIVO COM NOME CUSTOMIZADO (Ex: "Rosto_da_Lydia")
+                    logger::debug("[ScanFaceGeom] Custom Face detected (Non-FormID): {}", stem);
                     info.originFormID = 0;
                     info.displayName = stem;
                 }
@@ -1134,7 +1735,7 @@ void ScanFaceGeom() {
                 manager->IndexFaceGenNif(info.nifPath, info.originFormID);
 
             }
-            // CATCH ESPECÍFICO PARA O ERRO DE UNICODE DO WINDOWS
+            // CATCH ESPEC�FICO PARA O ERRO DE UNICODE DO WINDOWS
             catch (const std::system_error& se) {
                 logger::error("[ScanFaceGeom] Filesystem/Unicode encoding error reading a file. Skipping it. Info: {}", se.what());
             }
@@ -1147,7 +1748,7 @@ void ScanFaceGeom() {
         }
     }
 
-    logger::info("[ScanFaceGeom] Scan completed. Faces found: {}. Baked geometries indexed: {}. Duplicates ignored: {}.",
+    logger::debug("[ScanFaceGeom] Scan completed. Faces found: {}. Baked geometries indexed: {}. Duplicates ignored: {}.",
         scannedFaces.size(),
         manager->GetFaceGenGeometryIndexSize(),
         manager->GetFaceGenGeometryDuplicateCount());
@@ -1156,10 +1757,10 @@ void ScanFaceGeom() {
 
 void DrawMainEditorUI() {
     bool isLocked = (!ui_linkedPreset.empty() && !isEditingPreset);
-    bool hasErrors = false;
-    std::string errorMsgs = "";
+    bool hasHeadPartWarnings = false;
+    std::string headPartWarningMsgs = "";
 
-    // Deteta se o utilizador alterou qualquer coisa no ecrã
+    // Deteta se o utilizador alterou qualquer coisa no ecr�
     bool isDirty = HasUnsavedChanges();
 
     // Novo mapa para agrupar HeadParts pela categoria e identificar duplicatas
@@ -1168,9 +1769,9 @@ void DrawMainEditorUI() {
     for (auto hp : ui_headParts) {
         if (!hp) continue;
 
-        // 1. Checa Incompatibilidade (Raça e Sexo)
+        // 1. Checa Incompatibilidade (Ra�a e Sexo)
         if (!IsHeadPartValid(hp, ui_race, ui_isFemale)) {
-            hasErrors = true;
+            hasHeadPartWarnings = true;
 
             std::string allowedRaces = GetValidRacesString(hp);
 
@@ -1183,7 +1784,7 @@ void DrawMainEditorUI() {
             std::string edid = clib_util::editorID::get_editorID(hp);
             if (edid.empty()) edid = std::format("{:08X}", hp->GetFormID());
 
-            errorMsgs += std::format("- Incompatible: {} (Races: {} | Sex: {})\n", edid, allowedRaces, allowedSex);
+            headPartWarningMsgs += std::format("- Incompatible: {} (Races: {} | Sex: {})\n", edid, allowedRaces, allowedSex);
         }
 
         // 2. Agrupa as HeadParts pelo Tipo Base (Ignorando kIsExtraPart)
@@ -1192,11 +1793,11 @@ void DrawMainEditorUI() {
         }
     }
 
-    // 3. Checa conflitos de múltiplas peças BASE do mesmo tipo
+    // 3. Checa conflitos de m�ltiplas pe�as BASE do mesmo tipo
     for (const auto& [type, parts] : hpByType) {
-        // kMisc e kScar são exceções, o Skyrim permite múltiplos deles
+        // kMisc e kScar s�o exce��es, o Skyrim permite m�ltiplos deles
         if (parts.size() > 1 && type != RE::BGSHeadPart::HeadPartType::kMisc && type != RE::BGSHeadPart::HeadPartType::kScar) {
-            hasErrors = true;
+            hasHeadPartWarnings = true;
 
             std::string typeName = "Unknown";
             switch (type) {
@@ -1215,71 +1816,71 @@ void DrawMainEditorUI() {
             }
             if (!conflictNames.empty()) { conflictNames.pop_back(); conflictNames.pop_back(); }
 
-            errorMsgs += std::format("- Conflict ({}): Multiple base parts -> [{}]\n", typeName, conflictNames);
+            headPartWarningMsgs += std::format("- Conflict ({}): Multiple base parts -> [{}]\n", typeName, conflictNames);
         }
     }
 
-    if (hasErrors) {
-        ImGuiMCP::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "ERROR: Resolve the red incompatibilities to save!");
-        if (!errorMsgs.empty()) ImGuiMCP::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, errorMsgs.c_str());
+    if (hasHeadPartWarnings) {
+        ImGuiMCP::TextColored({ 1.0f, 0.65f, 0.15f, 1.0f }, "Warning: incompatible HeadParts are selected.");
+        ImGuiMCP::TextWrapped("These can cause invisible heads, broken eyes or hair, neck seams, bad morphs, or missing geometry. Use this only for replacers whose FaceGen/NIF was built for that HeadPart, verified cross-race/sex conversions, or special modded parts that intentionally omit vanilla race flags.");
+        if (!headPartWarningMsgs.empty()) ImGuiMCP::TextColored({ 1.0f, 0.45f, 0.25f, 1.0f }, headPartWarningMsgs.c_str());
     }
-    else {
-        if (!isEditingPreset && ImGuiMCP::Button("Apply in-game")) { ApplyNPC(); }
+
+    if (!isEditingPreset && ImGuiMCP::Button("Apply in-game")) { ApplyNPC(); }
+    ImGuiMCP::SameLine();
+
+    // D� uma cor de aviso ao bot�o de "SALVAR" se estiver "sujo"
+    if (isDirty) ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.6f, 0.4f, 0.1f, 1.0f });
+    if (ImGuiMCP::Button("Save data")) { SaveData(); }
+    if (isDirty) ImGuiMCP::PopStyleColor();
+
+    if (!isEditingPreset) {
         ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button("Undo Changes")) { RevertNPC(); }
 
-        // Dá uma cor de aviso ao botão de "SALVAR" se estiver "sujo"
-        if (isDirty) ImGuiMCP::PushStyleColor(ImGuiMCP::ImGuiCol_Button, { 0.6f, 0.4f, 0.1f, 1.0f });
-        if (ImGuiMCP::Button("Save data")) { SaveData(); }
-        if (isDirty) ImGuiMCP::PopStyleColor();
+        ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button("Restore Default")) { RestoreDefaultNPC(); }
 
-        if (!isEditingPreset) {
-            ImGuiMCP::SameLine();
-            if (ImGuiMCP::Button("Undo Changes")) { RevertNPC(); }
+        if (g_currentNPC) {
+            std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
+            if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
+            std::string filePath = ResolveJsonPath(NPCPath, LegacyNPCPath, editorID).string();
 
-            ImGuiMCP::SameLine();
-            if (ImGuiMCP::Button("Restore Default")) { RestoreDefaultNPC(); }
+            if (std::filesystem::exists(filePath)) {
+                ImGuiMCP::SameLine();
 
-            if (g_currentNPC) {
-                std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
-                if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
-                std::string filePath = std::format("{}/{}.json", NPCPath, editorID);
-
-                if (std::filesystem::exists(filePath)) {
-                    ImGuiMCP::SameLine();
-
-                    // Bloqueio do botão caso tenha edições por guardar
-                    if (isDirty) {
-                        ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
-                        if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("There are pending changes. Click Save data first.");
+                // Bloqueio do bot�o caso tenha edi��es por guardar
+                if (isDirty) {
+                    ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
+                    if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("There are pending changes. Click Save data first.");
+                }
+                else {
+                    if (ImGuiMCP::Button("Export")) {
+                        ExportNPCAsZip(g_currentNPC, ui_linkedPreset);
                     }
-                    else {
-                        if (ImGuiMCP::Button("Export")) {
-                            ExportNPCAsZip(g_currentNPC, ui_linkedPreset);
-                        }
-                        if (ImGuiMCP::IsItemHovered()) {
-                            ImGuiMCP::SetTooltip("The .zip file will be saved in the folder:\nData/Exports");
-                        }
+                    if (ImGuiMCP::IsItemHovered()) {
+                        ImGuiMCP::SetTooltip(GetLoc("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export."));
                     }
                 }
             }
         }
-        else if (isEditingPreset && !activePresetName.empty()) {
-            std::string presetPath = std::format("{}/{}.json", PresetsPath, activePresetName);
-            if (std::filesystem::exists(presetPath)) {
-                ImGuiMCP::SameLine();
+    }
+    else if (isEditingPreset && !activePresetName.empty()) {
+        std::string presetPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, activePresetName).string();
+        if (std::filesystem::exists(presetPath)) {
+            ImGuiMCP::SameLine();
 
-                // Bloqueio do botão caso tenha edições por guardar
-                if (isDirty) {
-                    ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
-                    if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("There are pending changes. Click SAVE DATA first.");
+            // Bloqueio do bot�o caso tenha edi��es por guardar
+            if (isDirty) {
+                ImGuiMCP::TextColored({ 0.6f, 0.6f, 0.6f, 1.0f }, "[Save to Export]");
+                if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("There are pending changes. Click SAVE DATA first.");
+            }
+            else {
+                if (ImGuiMCP::Button("Export")) {
+                    ExportPresetAsZip(activePresetName);
                 }
-                else {
-                    if (ImGuiMCP::Button("Export")) {
-                        ExportPresetAsZip(activePresetName);
-                    }
-                    if (ImGuiMCP::IsItemHovered()) {
-                        ImGuiMCP::SetTooltip("The .zip file will be saved in the folder:\nData/Exports");
-                    }
+                if (ImGuiMCP::IsItemHovered()) {
+                    ImGuiMCP::SetTooltip(GetLoc("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export."));
                 }
             }
         }
@@ -1290,7 +1891,7 @@ void DrawMainEditorUI() {
         ImGuiMCP::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "This NPC is locked and using PRESET: %s", ui_linkedPreset.c_str());
         if (ImGuiMCP::Button("Unlink Preset (Free Edit)")) ui_linkedPreset = "";
 
-        // PONTO 1: Botão para Editar o Preset linkado
+        // PONTO 1: Bot�o para Editar o Preset linkado
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button("Edit this Preset")) {
             LoadPresetToUI(ui_linkedPreset);
@@ -1350,7 +1951,7 @@ void DrawMainEditorUI() {
     }
 
     // ==========================================
-    // MODAL DE SELEÇÃO DE PRESETS COM IMAGEM
+    // MODAL DE SELE��O DE PRESETS COM IMAGEM
     // ==========================================
     if (openPresetSelectModal) ImGuiMCP::OpenPopup("Select Preset");
     if (ImGuiMCP::BeginPopupModal("Select Preset", &openPresetSelectModal, ImGuiMCP::ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1409,20 +2010,14 @@ void DrawMainEditorUI() {
                     ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f));
                     ImGuiMCP::Text("%s", preset.name.c_str());
 
-                    // Coluna 2: Botão Ação
+                    // Coluna 2: Bot�o A��o
                     ImGuiMCP::TableSetColumnIndex(2);
                     ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f));
                     if (ImGuiMCP::Button("Apply Preset", ImGuiMCP::ImVec2(120))) {
-                        std::string pPath = std::format("{}/{}.json", PresetsPath, preset.name);
-                        FILE* fp = nullptr;
-                        fopen_s(&fp, pPath.c_str(), "rb");
-                        if (fp) {
-                            char readBuffer[65536];
-                            rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                            rapidjson::Document doc;
-                            doc.ParseStream(is);
-                            fclose(fp);
-                            ParseJSONToUI(doc); // Aplica JSON à Interface
+                        std::string pPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, preset.name).string();
+                        rapidjson::Document doc;
+                        if (ReadJsonObjectFromFile(pPath, doc, "UI/ApplyPresetButton")) {
+                            ParseJSONToUI(doc); // Aplica JSON a Interface
                         }
                         ui_linkedPreset = preset.name;
                         SaveData();
@@ -1479,28 +2074,7 @@ void DrawMainEditorUI() {
     ImGuiMCP::Separator();
     ImGuiMCP::Text("Custom Face");
     if (!ui_customFaceNif.empty()) {
-
-        // --- EXTRAIR NOME DO NPC PARA A UI ---
-        std::string displayFaceName = ui_customFaceNif;
-        size_t lastSlash = ui_customFaceNif.find_last_of("\\/");
-        if (lastSlash != std::string::npos) {
-            std::string stem = ui_customFaceNif.substr(lastSlash + 1);
-            size_t dot = stem.find_last_of(".");
-            if (dot != std::string::npos) stem = stem.substr(0, dot);
-            try {
-                RE::FormID id = std::stoul(stem, nullptr, 16);
-                if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(id)) {
-                    displayFaceName = std::format("{} [{:08X}]", npc->GetFullName() ? npc->GetFullName() : "Unnamed", id);
-                }
-                else {
-                    displayFaceName = std::format("Unknown [{:08X}]", id);
-                }
-            }
-            catch (...) {
-                displayFaceName = stem; // Fallback se não for um ID válido
-            }
-        }
-        // ------------------------------------
+        std::string displayFaceName = ResolveFaceDisplayName(ui_customFaceNif);
 
         ImGuiMCP::TextColored({ 0.2f, 1.0f, 0.2f, 1.0f }, "Loaded Sculpt: %s", displayFaceName.c_str());
         if (ImGuiMCP::Button("Remove Sculpt")) {
@@ -1526,7 +2100,7 @@ void DrawMainEditorUI() {
         std::string searchStr(faceSearch);
         std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), [](unsigned char c) { return std::tolower(c); });
 
-        // 1. Filtrar previamente os índices baseados na busca
+        // 1. Filtrar previamente os �ndices baseados na busca
         std::vector<size_t> filteredIdx;
         for (size_t i = 0; i < scannedFaces.size(); i++) {
             std::string lowerName = scannedFaces[i].displayName;
@@ -1548,7 +2122,7 @@ void DrawMainEditorUI() {
 
             int totalItems = static_cast<int>(filteredIdx.size());
             static auto clipper = ImGuiMCP::ImGuiListClipperManager::Create();
-            ImGuiMCP::ImGuiListClipperManager::Begin(clipper, totalItems, 160.0f); // 160.0f força altura mínima da linha
+            ImGuiMCP::ImGuiListClipperManager::Begin(clipper, totalItems, 160.0f); // 160.0f for�a altura m�nima da linha
 
             while (ImGuiMCP::ImGuiListClipperManager::Step(clipper)) {
                 for (int i = clipper->DisplayStart; i < clipper->DisplayEnd; i++) {
@@ -1579,19 +2153,40 @@ void DrawMainEditorUI() {
                     // Mostra o path reduzido (sem a diretoria da engine)
                     ImGuiMCP::TextDisabled("%s", face.displayPath.c_str());
 
-                    // Coluna 2: Botão de Ação
+                    // Coluna 2: Bot�o de A��o
                     ImGuiMCP::TableSetColumnIndex(2);
-                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f)); // Desce um pouco o botão
+                    ImGuiMCP::Dummy(ImGuiMCP::ImVec2(0, 10.0f)); // Desce um pouco o bot�o
                     if (ImGuiMCP::Button("Select Face", ImGuiMCP::ImVec2(120))) {
                         ui_customFaceNif = face.nifPath; // O jogo ainda usa o path original
 
                         RE::BGSHeadPart* targetHp = Manager::ExtractHeadPartFromNif(ui_customFaceNif);
                         if (targetHp) {
-                            auto it = std::remove_if(ui_headParts.begin(), ui_headParts.end(), [](RE::BGSHeadPart* hp) {
-                                return hp && hp->type == RE::BGSHeadPart::HeadPartType::kFace;
-                                });
-                            ui_headParts.erase(it, ui_headParts.end());
-                            ui_headParts.push_back(targetHp);
+                            const auto* model = targetHp->GetModel();
+                            if (targetHp->type == RE::BGSHeadPart::HeadPartType::kFace &&
+                                model && model[0] != '\0') {
+                                auto it = std::remove_if(ui_headParts.begin(), ui_headParts.end(), [](RE::BGSHeadPart* hp) {
+                                    return hp && hp->type == RE::BGSHeadPart::HeadPartType::kFace;
+                                    });
+                                ui_headParts.erase(it, ui_headParts.end());
+                                ui_headParts.push_back(targetHp);
+                                logger::debug("[UI] Custom face selecionada com troca de Face HeadPart para '{}'.",
+                                    targetHp->GetFormEditorID() ? targetHp->GetFormEditorID() : "");
+                                if (!IsHeadPartValid(targetHp, ui_race, ui_isFemale)) {
+                                    logger::warn("[UI] Custom face '{}' aplicou Face HeadPart incompatível por override: '{}'.",
+                                        ui_customFaceNif,
+                                        targetHp->GetFormEditorID() ? targetHp->GetFormEditorID() : "");
+                                }
+                            }
+                            else {
+                                logger::warn("[UI] Custom face '{}' possui Face HeadPart sem modelo valido '{}' (type={} model='{}'). Mantendo Face HeadPart atual.",
+                                    ui_customFaceNif,
+                                    targetHp->GetFormEditorID() ? targetHp->GetFormEditorID() : "",
+                                    targetHp->type.underlying(),
+                                    model ? model : "");
+                            }
+                        }
+                        else {
+                            logger::warn("[UI] Custom face selecionada, mas nenhuma Face HeadPart foi encontrada na NIF: {}", ui_customFaceNif);
                         }
                         openFaceSelectModal = false;
                         ImGuiMCP::CloseCurrentPopup();
@@ -1669,7 +2264,19 @@ void DrawMainEditorUI() {
         ImGuiMCP::SetNextItemWidth(200.0f);
         ImGuiMCP::Combo("Category##Add", &s_hpCatIdx, ui_categories, 7);
 
-        DrawDropdown("Parts (Compatible)##Add", ui_categories[s_hpCatIdx], &newHp, s_newHpIdx, false, true, 340.0f);
+        static bool showIncompatibleHeadParts = false;
+        ImGuiMCP::Checkbox("Show incompatible HeadParts", &showIncompatibleHeadParts);
+        if (ImGuiMCP::IsItemHovered()) {
+            ImGuiMCP::SetTooltip("Allows selecting HeadParts outside the current race/sex filters. Use only for verified replacers or special modded parts.");
+        }
+
+        DrawDropdown(showIncompatibleHeadParts ? "Parts (All)##Add" : "Parts (Compatible)##Add",
+            ui_categories[s_hpCatIdx],
+            &newHp,
+            s_newHpIdx,
+            false,
+            !showIncompatibleHeadParts,
+            340.0f);
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button("Add Part")) {
             if (newHp && std::find(ui_headParts.begin(), ui_headParts.end(), newHp) == ui_headParts.end()) {
@@ -1832,6 +2439,8 @@ void DrawMainEditorUI() {
 }
 
 void NSettings::Presets() {
+    EnsureMenuListsPopulated();
+
     ImGuiMCP::Text("Preset Manager");
     ImGuiMCP::Separator();
 
@@ -1844,20 +2453,19 @@ void NSettings::Presets() {
     static bool needsUsageScan = true;
     if (ImGuiMCP::Button("Refresh Usage List") || needsUsageScan) {
         presetUsageDB.clear();
-        if (std::filesystem::exists(NPCPath)) {
-            for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
-                if (entry.path().extension() == ".json") {
-                    FILE* fp = nullptr;
-                    fopen_s(&fp, entry.path().string().c_str(), "rb");
-                    if (fp) {
-                        char readBuffer[2048];
-                        rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                        rapidjson::Document doc;
-                        doc.ParseStream(is);
-                        fclose(fp);
-                        if (doc.IsObject() && doc.HasMember("preset") && doc["preset"].IsString()) {
-                            presetUsageDB[doc["preset"].GetString()].push_back(entry.path().stem().string());
-                        }
+        for (const auto& npcJson : CollectJsonFiles(NPCPath, LegacyNPCPath)) {
+            std::filesystem::directory_entry entry(npcJson);
+            if (entry.path().extension() == ".json") {
+                FILE* fp = nullptr;
+                fopen_s(&fp, entry.path().string().c_str(), "rb");
+                if (fp) {
+                    char readBuffer[2048];
+                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+                    rapidjson::Document doc;
+                    doc.ParseStream(is);
+                    fclose(fp);
+                    if (doc.IsObject() && doc.HasMember("preset") && doc["preset"].IsString()) {
+                        presetUsageDB[doc["preset"].GetString()].push_back(entry.path().stem().string());
                     }
                 }
             }
@@ -1870,9 +2478,9 @@ void NSettings::Presets() {
     static bool openApplyModal = false;
     static std::string presetToApply = "";
     static std::set<RE::FormID> selectedNPCs;
-    static std::set<RE::FormID> originalSelectedNPCs; 
+    static std::set<RE::FormID> originalSelectedNPCs;
 
-    // Variáveis para o Delete Modal
+    // Vari�veis para o Delete Modal
     static bool openDeleteModal = false;
     static std::string presetToDelete = "";
     static bool deleteLinkedNPCs = false;
@@ -1890,7 +2498,7 @@ void NSettings::Presets() {
 
         for (const auto& pName : ui_availablePresets) {
             ImGuiMCP::PushID(pName.c_str());
-            ImGuiMCP::TableNextRow(ImGuiMCP::ImGuiTableRowFlags_None, 100.0f); // Força altura da linha
+            ImGuiMCP::TableNextRow(ImGuiMCP::ImGuiTableRowFlags_None, 100.0f); // For�a altura da linha
 
             // Encontra a imagem do Preset (se existir)
             void* texID = nullptr;
@@ -1918,7 +2526,7 @@ void NSettings::Presets() {
                 auto manager = Manager::GetSingleton();
                 const auto& npcList = manager->GetList("NPC");
 
-                // Pré-popula as checkboxes com os NPCs que já utilizam este preset
+                // Pr�-popula as checkboxes com os NPCs que j� utilizam este preset
                 for (const auto& u : presetUsageDB[pName]) {
                     for (const auto& item : npcList) {
                         if (item.editorID == u || std::format("{:08X}", item.formID) == u) {
@@ -1939,7 +2547,7 @@ void NSettings::Presets() {
             }
             else {
                 if (ImGuiMCP::Button("Export")) ExportPresetAsZip(pName);
-                if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip("The .zip file will be saved in the folder:\nData/Exports");
+                if (ImGuiMCP::IsItemHovered()) ImGuiMCP::SetTooltip(GetLoc("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export."));
             }
 
             // Coluna 4 - Delete
@@ -1963,7 +2571,7 @@ void NSettings::Presets() {
             if (!users.empty()) { users.pop_back(); users.pop_back(); }
             ImGuiMCP::TextWrapped("%s", users.empty() ? "None" : users.c_str());
 
-            ImGuiMCP::PopID(); 
+            ImGuiMCP::PopID();
         }
         ImGuiMCP::EndTable();
     }
@@ -2039,14 +2647,15 @@ void NSettings::Presets() {
                     if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
                         std::string editorID = clib_util::editorID::get_editorID(npc);
                         if (editorID.empty()) editorID = std::format("{:08X}", formID);
-                        std::string finalPath = std::format("{}/{}.json", NPCPath, editorID);
+                        std::string finalPath = ResolveJsonPath(NPCPath, LegacyNPCPath, editorID).string();
+                        RemoveJsonInBothLocations(NPCPath, LegacyNPCPath, editorID);
 
-                        // Apaga a ligação
+                        // Apaga a liga��o
                         if (std::filesystem::exists(finalPath)) {
                             std::filesystem::remove(finalPath);
                         }
 
-                        // Restaura o estado em memória para Vanilla
+                        // Restaura o estado em mem�ria para Vanilla
                         if (g_vanillaNPCStates.contains(formID)) {
                             rapidjson::Document doc;
                             doc.Parse(g_vanillaNPCStates[formID].c_str());
@@ -2058,15 +2667,8 @@ void NSettings::Presets() {
 
             // 2. Aplica o Preset aos NPCs marcados
             rapidjson::Document presetDoc;
-            std::string pPath = std::format("{}/{}.json", PresetsPath, presetToApply);
-            FILE* pFp = nullptr;
-            fopen_s(&pFp, pPath.c_str(), "rb");
-            if (pFp) {
-                char readBuffer[65536];
-                rapidjson::FileReadStream is(pFp, readBuffer, sizeof(readBuffer));
-                presetDoc.ParseStream(is);
-                fclose(pFp);
-            }
+            std::string pPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, presetToApply).string();
+            ReadJsonObjectFromFile(pPath, presetDoc, "UI/MassApplyPreset");
 
             std::string presetNif = "";
             if (presetDoc.HasMember("customFaceNif") && presetDoc["customFaceNif"].IsString()) {
@@ -2077,8 +2679,11 @@ void NSettings::Presets() {
                 if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
 
                     Manager::GetSingleton()->RegisterAffectedNPC(formID, presetNif);
-                    // Aplica em Memória
-                    if (presetDoc.IsObject()) Manager::ApplyNPCCustomizationFromJSON(npc, presetDoc);
+                    // Aplica em Memoria
+                    if (presetDoc.IsObject()) {
+                        rapidjson::Document safePresetDoc = BuildSafeCustomizationDocument(npc, presetDoc);
+                        Manager::ApplyNPCCustomizationFromJSON(npc, safePresetDoc);
+                    }
 
                     // Salva JSON no Disco
                     rapidjson::Document doc;
@@ -2089,7 +2694,7 @@ void NSettings::Presets() {
                     std::string editorID = clib_util::editorID::get_editorID(npc);
                     if (editorID.empty()) editorID = std::format("{:08X}", npc->GetFormID());
 
-                    std::filesystem::create_directories(NPCPath);
+                    EnsureStorageDirectories();
                     std::string finalPath = std::format("{}/{}.json", NPCPath, editorID);
 
                     FILE* fp = nullptr;
@@ -2100,6 +2705,7 @@ void NSettings::Presets() {
                         rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(os);
                         doc.Accept(writer);
                         fclose(fp);
+                        FinalizeLegacyMigrationAfterSave(NPCPath, LegacyNPCPath, editorID);
                     }
                 }
             }
@@ -2147,10 +2753,11 @@ void NSettings::Presets() {
 
         if (ImGuiMCP::Button("Yes, Delete", ImGuiMCP::ImVec2(120, 0))) {
             // Deleta o arquivo do Preset do disco
-            std::string presetPath = std::format("{}/{}.json", PresetsPath, presetToDelete);
+            std::string presetPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, presetToDelete).string();
             if (std::filesystem::exists(presetPath)) {
                 std::filesystem::remove(presetPath);
             }
+            RemoveJsonInBothLocations(PresetsPath, LegacyPresetsPath, presetToDelete);
 
             // Deleta os NPCs vinculados se o utilizador confirmou no checkbox
             if (deleteLinkedNPCs && !users.empty()) {
@@ -2164,13 +2771,14 @@ void NSettings::Presets() {
                         catch (...) {}
                     }
                     if (formID != 0) {
-                        Manager::GetSingleton()->UnregisterAffectedNPC(formID); 
+                        Manager::GetSingleton()->UnregisterAffectedNPC(formID);
                     }
 
-                    std::string nPath = std::format("{}/{}.json", NPCPath, u);
+                    std::string nPath = ResolveJsonPath(NPCPath, LegacyNPCPath, u).string();
                     if (std::filesystem::exists(nPath)) {
                         std::filesystem::remove(nPath);
                     }
+                    RemoveJsonInBothLocations(NPCPath, LegacyNPCPath, u);
                 }
             }
 
@@ -2197,12 +2805,14 @@ void NSettings::Presets() {
 }
 
 void NSettings::NPCList() {
+    EnsureMenuListsPopulated();
+
     auto manager = Manager::GetSingleton();
     const auto& npcList = manager->GetList("NPC");
 
     if (npcList.empty()) {
         ImGuiMCP::Text("No NPCs loaded into memory. Force a scan.");
-        if (ImGuiMCP::Button("Force Scan")) manager->PopulateAllLists();
+        if (ImGuiMCP::Button("Force Scan")) manager->PopulateAllLists(true);
         return;
     }
 
@@ -2211,26 +2821,18 @@ void NSettings::NPCList() {
 
     if (needScan) {
         affectedDB.clear();
-        if (std::filesystem::exists(NPCPath)) {
-            for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
-                if (entry.path().extension() == ".json") {
-                    std::string stem = entry.path().stem().string();
-                    std::string presetLinked = "Custom";
+        for (const auto& npcJson : CollectJsonFiles(NPCPath, LegacyNPCPath)) {
+            std::filesystem::directory_entry entry(npcJson);
+            if (entry.path().extension() == ".json") {
+                std::string stem = entry.path().stem().string();
+                std::string presetLinked = "Custom";
 
-                    FILE* fp = nullptr;
-                    fopen_s(&fp, entry.path().string().c_str(), "rb");
-                    if (fp) {
-                        char readBuffer[2048];
-                        rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                        rapidjson::Document doc;
-                        doc.ParseStream(is);
-                        fclose(fp);
-                        if (doc.IsObject() && doc.HasMember("preset") && doc["preset"].IsString()) {
-                            presetLinked = doc["preset"].GetString();
-                        }
-                    }
-                    affectedDB[stem] = presetLinked;
+                rapidjson::Document doc;
+                if (ReadJsonObjectFromFile(entry.path(), doc, "UI/NPCListScan") &&
+                    doc.HasMember("preset") && doc["preset"].IsString()) {
+                    presetLinked = doc["preset"].GetString();
                 }
+                affectedDB[stem] = presetLinked;
             }
         }
         needScan = false;
@@ -2301,7 +2903,7 @@ void NSettings::NPCList() {
                 if (ImGuiMCP::Button("Edit")) {
                     if (auto npc = RE::TESForm::LookupByID<RE::TESNPC>(item.formID)) {
                         LoadNPCToUI(npc, nullptr);
-                        // A UI não troca de aba automaticamente pois SKSEMenuFramework não suporta isso em runtime.
+                        // A UI n�o troca de aba automaticamente pois SKSEMenuFramework n�o suporta isso em runtime.
                     }
                 }
                 ImGuiMCP::PopID();
@@ -2329,6 +2931,7 @@ void NSettings::NPCList() {
 }
 
 void NSettings::NPCMenu() {
+    EnsureMenuListsPopulated();
 
 
     if (!isEditingPreset) {
@@ -2342,7 +2945,7 @@ void NSettings::NPCMenu() {
         if (ImGuiMCP::Button("<- Exit Preset Editor")) {
             isEditingPreset = false;
             activePresetName = "";
-            g_currentNPC = nullptr; // Limpa para forçar carregar outro
+            g_currentNPC = nullptr; // Limpa para for�ar carregar outro
         }
         ImGuiMCP::Separator();
         DrawMainEditorUI();
@@ -2360,156 +2963,245 @@ void NSettings::NPCMenu() {
     }
 }
 
+void NSettings::Export() {
+    EnsureMenuListsPopulated();
+    EnsureStorageDirectories();
+
+    static std::set<std::string> selectedPresets;
+    static std::set<std::string> selectedNPCs;
+    static char packageName[128] = "NPCVisual_Export";
+
+    const auto presetFiles = CollectJsonFiles(PresetsPath, LegacyPresetsPath);
+    const auto npcFiles = CollectJsonFiles(NPCPath, LegacyNPCPath);
+
+    ImGuiMCP::Text("%s", GetLoc("export.title", "Export Package"));
+    ImGuiMCP::Separator();
+    ImGuiMCP::TextWrapped("%s", GetLoc("export.description", "Select presets and NPC edits to export into one ZIP package."));
+    ImGuiMCP::TextColored({ 0.7f, 0.7f, 0.7f, 1.0f }, "%s", GetLoc("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export."));
+    ImGuiMCP::Separator();
+
+    ImGuiMCP::SetNextItemWidth(260.0f);
+    ImGuiMCP::InputText("Package Name", packageName, sizeof(packageName));
+    ImGuiMCP::SameLine();
+    if (ImGuiMCP::Button(GetLoc("export.refresh", "Refresh Lists"))) {
+        selectedPresets.clear();
+        selectedNPCs.clear();
+    }
+    ImGuiMCP::SameLine();
+    if (ImGuiMCP::Button(GetLoc("export.export_selected", "Export Selected"))) {
+        ExportSelectedPackage(packageName, selectedPresets, selectedNPCs);
+    }
+
+    ImGuiMCP::Separator();
+
+    auto tableFlags = ImGuiMCP::ImGuiTableFlags_Borders | ImGuiMCP::ImGuiTableFlags_RowBg | ImGuiMCP::ImGuiTableFlags_Resizable;
+    if (ImGuiMCP::BeginTable("ExportSelection", 2, tableFlags)) {
+        ImGuiMCP::TableSetupColumn("Presets", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableSetupColumn("NPC Edits", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGuiMCP::TableHeadersRow();
+        ImGuiMCP::TableNextRow();
+
+        ImGuiMCP::TableSetColumnIndex(0);
+        ImGuiMCP::BeginChild("ExportPresetList", ImGuiMCP::ImVec2(0, 520), true);
+        if (presetFiles.empty()) {
+            ImGuiMCP::TextDisabled("No presets found.");
+        }
+        for (const auto& file : presetFiles) {
+            const auto name = file.stem().string();
+            bool selected = selectedPresets.contains(name);
+            ImGuiMCP::PushID(("preset_" + name).c_str());
+            if (ImGuiMCP::Checkbox(name.c_str(), &selected)) {
+                if (selected) selectedPresets.insert(name);
+                else selectedPresets.erase(name);
+            }
+            ImGuiMCP::PopID();
+        }
+        ImGuiMCP::EndChild();
+
+        ImGuiMCP::TableSetColumnIndex(1);
+        ImGuiMCP::BeginChild("ExportNPCList", ImGuiMCP::ImVec2(0, 520), true);
+        if (npcFiles.empty()) {
+            ImGuiMCP::TextDisabled("No NPC edits found.");
+        }
+        for (const auto& file : npcFiles) {
+            const auto name = file.stem().string();
+            bool selected = selectedNPCs.contains(name);
+            ImGuiMCP::PushID(("npc_" + name).c_str());
+            if (ImGuiMCP::Checkbox(name.c_str(), &selected)) {
+                if (selected) selectedNPCs.insert(name);
+                else selectedNPCs.erase(name);
+            }
+            const auto linkedPreset = ReadLinkedPresetName(file);
+            if (!linkedPreset.empty()) {
+                ImGuiMCP::SameLine();
+                ImGuiMCP::TextColored({ 0.55f, 0.75f, 1.0f, 1.0f }, "Preset: %s", linkedPreset.c_str());
+            }
+            ImGuiMCP::PopID();
+        }
+        ImGuiMCP::EndChild();
+
+        ImGuiMCP::EndTable();
+    }
+
+    ImGuiMCP::Text("Selected: %d preset(s), %d NPC edit(s)", static_cast<int>(selectedPresets.size()), static_cast<int>(selectedNPCs.size()));
+}
+
+void NSettings::Debug()
+{
+    if (ImGuiMCP::Button("Update lists")) {
+        auto* manager = Manager::GetSingleton();
+        if (manager) {
+            manager->_isPopulated = false;
+            manager->PopulateAllLists();
+        }
+    }
+}
+
 
 
 void NSettings::MmRegister() {
     if (SKSEMenuFramework::IsInstalled()) {
+        EnsureStorageDirectories();
+        LoadLanguage();
         SKSEMenuFramework::SetSection("NPC Visual Editor");
-        SKSEMenuFramework::AddSectionItem("Editor", NPCMenu);
-        SKSEMenuFramework::AddSectionItem("Presets", Presets);
-        SKSEMenuFramework::AddSectionItem("Database", NPCList);
-		logger::info("[MmRegister] Menu sections registered successfully.");
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.editor", "Editor"), NPCMenu);
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.presets", "Presets"), Presets);
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.database", "Database"), NPCList);
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.export", "Export"), Export);
+        SKSEMenuFramework::AddSectionItem("Debug", Debug);
+        logger::debug("[MmRegister] Menu sections registered successfully.");
     }
 }
 
-// Carregamento de Inicialização (Auto-Load no jogo)
 void NSettings::Load() {
-    logger::info("[Load] Inicializando sistema de arquivos...");
-    std::filesystem::create_directories(NPCPath);
-    std::filesystem::create_directories(PresetsPath);
+    logger::debug("[Load] Inicializando sistema de arquivos...");
+    EnsureStorageDirectories();
+    LoadLanguage();
+    Manager::GetSingleton()->ClearAffectedNPCs();
+    refreshListsOnNextMenuOpen = true;
 
     int countPresetsCarregados = 0;
     int countNPCsModificados = 0;
 
     std::map<std::string, rapidjson::Document> presetCache;
 
-    logger::info("[Load] Passo 1: Lendo arquivos na pasta de Presets...");
-    for (const auto& entry : std::filesystem::directory_iterator(PresetsPath)) {
-        if (entry.path().extension() == ".json") {
-            std::string presetName = entry.path().stem().string();
-            FILE* fp = nullptr;
-            fopen_s(&fp, entry.path().string().c_str(), "rb");
-            if (fp) {
-                try {
-                    char readBuffer[65536];
-                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                    rapidjson::Document doc;
-                    doc.ParseStream(is);
-                    fclose(fp);
-                    if (doc.IsObject()) {
-                        presetCache[presetName] = std::move(doc);
-                        countPresetsCarregados++;
-                        logger::info("[Load] Preset cacheado com sucesso: {}", presetName);
-                    }
-                    else {
-                        logger::warn("[Load] Falha ao analisar o JSON (nao eh um objeto valido): {}", presetName);
-                    }
+    logger::debug("[Load] Passo 1: Lendo arquivos na pasta de Presets...");
+    for (const auto& presetJson : CollectJsonFiles(PresetsPath, LegacyPresetsPath)) {
+        std::filesystem::directory_entry entry(presetJson);
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+
+        std::string presetName = entry.path().stem().string();
+        rapidjson::Document doc;
+        if (!ReadJsonObjectFromFile(entry.path(), doc, "Load/Preset")) {
+            logger::warn("[Load] Preset ignorado por JSON invalido: {}", presetName);
+            continue;
+        }
+
+        presetCache[presetName] = std::move(doc);
+        countPresetsCarregados++;
+        logger::debug("[Load] Preset cacheado com sucesso: {}", presetName);
+    }
+
+    logger::debug("[Load] Passo 2: Lendo arquivos na pasta de NPCs...");
+    for (const auto& npcJson : CollectJsonFiles(NPCPath, LegacyNPCPath)) {
+        std::filesystem::directory_entry entry(npcJson);
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+
+        std::string filename = entry.path().stem().string();
+        logger::debug("[Load] Processando arquivo de NPC: {}.json", filename);
+
+        RE::TESNPC* targetNPC = nullptr;
+
+        if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
+            targetNPC = edidForm->As<RE::TESNPC>();
+        }
+        else {
+            try {
+                RE::FormID id = std::stoul(filename, nullptr, 16);
+                if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
+            }
+            catch (...) {
+                logger::warn("[Load] Arquivo '{}' tem nome invalido (Nao eh EditorID nem Hex FormID).", filename);
+            }
+        }
+
+        if (!targetNPC) {
+            logger::error("[Load] Falha! NPC base '{}' nao encontrado na memoria do jogo.", filename);
+            continue;
+        }
+
+        logger::debug("[Load] NPC '{}' resolvido para FormID {:08X}. Lendo JSON...", filename, targetNPC->GetFormID());
+
+        rapidjson::Document doc;
+        if (!ReadJsonObjectFromFile(entry.path(), doc, "Load/NPC")) {
+            logger::warn("[Load] NPC '{}' ignorado por JSON invalido.", filename);
+            continue;
+        }
+
+        std::string nifPath = "";
+
+        // Verifica se este NPC usa um Preset linkado.
+        if (doc.HasMember("preset") && doc["preset"].IsString()) {
+            std::string presetName = doc["preset"].GetString();
+            logger::debug("[Load] NPC {:08X} vinculado ao Preset '{}'.", targetNPC->GetFormID(), presetName);
+
+            auto presetIt = presetCache.find(presetName);
+            if (presetIt != presetCache.end()) {
+                rapidjson::Document safePresetDoc = BuildSafeCustomizationDocument(targetNPC, presetIt->second);
+
+                logger::debug("[Load] BEGIN Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
+                Manager::ApplyNPCCustomizationFromJSON(targetNPC, safePresetDoc);
+                logger::debug("[Load] END Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
+
+                if (safePresetDoc.HasMember("customFaceNif") && safePresetDoc["customFaceNif"].IsString()) {
+                    nifPath = safePresetDoc["customFaceNif"].GetString();
                 }
-                catch (...) {
-                    if (fp) fclose(fp);
-                    logger::error("[Load] Excecao ao ler o arquivo de Preset: {}", presetName);
+
+                if (!nifPath.empty()) {
+                    logger::debug("[Load] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
+                    Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
+                    logger::debug("[Load] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
                 }
+                else {
+                    Manager::GetSingleton()->UnregisterAffectedNPC(targetNPC->GetFormID());
+                    logger::debug("[Load] Preset sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
+                }
+                countNPCsModificados++;
             }
             else {
-                logger::error("[Load] Falha ao abrir o arquivo do Preset: {}", presetName);
+                logger::error("[Load] ABORTANDO: NPC {} aponta para preset '{}' que NAO FOI ENCONTRADO no cache.", filename, presetName);
             }
+        }
+        else {
+            rapidjson::Document safeDoc = BuildSafeCustomizationDocument(targetNPC, doc);
+
+            logger::debug("[Load] Aplicando JSON customizado unico para NPC {:08X}.", targetNPC->GetFormID());
+            logger::debug("[Load] BEGIN Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
+            Manager::ApplyNPCCustomizationFromJSON(targetNPC, safeDoc);
+            logger::debug("[Load] END Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
+
+            if (safeDoc.HasMember("customFaceNif") && safeDoc["customFaceNif"].IsString()) {
+                nifPath = safeDoc["customFaceNif"].GetString();
+            }
+
+            if (!nifPath.empty()) {
+                logger::debug("[Load] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
+                Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
+                logger::debug("[Load] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
+            }
+            else {
+                Manager::GetSingleton()->UnregisterAffectedNPC(targetNPC->GetFormID());
+                logger::debug("[Load] JSON sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
+            }
+            countNPCsModificados++;
         }
     }
 
-    logger::info("[Load] Passo 2: Lendo arquivos na pasta de NPCs...");
-    for (const auto& entry : std::filesystem::directory_iterator(NPCPath)) {
-        if (entry.path().extension() == ".json") {
-            std::string filename = entry.path().stem().string();
-            logger::info("[Load] Processando arquivo de NPC: {}.json", filename);
-
-            RE::TESNPC* targetNPC = nullptr;
-
-            // Tentativa de Lookup por EditorID ou FormID
-            if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
-                targetNPC = edidForm->As<RE::TESNPC>();
-            }
-            else {
-                try {
-                    RE::FormID id = std::stoul(filename, nullptr, 16);
-                    if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
-                }
-                catch (...) {
-                    logger::warn("[Load] Arquivo '{}' tem nome invalido (Nao eh EditorID nem Hex FormID).", filename);
-                }
-            }
-
-            if (!targetNPC) {
-                logger::error("[Load] Falha! NPC base '{}' nao encontrado na memoria do jogo.", filename);
-                continue; // Pula este arquivo
-            }
-
-            logger::info("[Load] NPC '{}' resolvido para FormID {:08X}. Lendo JSON...", filename, targetNPC->GetFormID());
-
-            // Salva Vanilla State antes de alterar
-            if (!g_vanillaNPCStates.contains(targetNPC->GetFormID())) {
-                std::string vanillaStr;
-                CaptureVanillaState(targetNPC, vanillaStr);
-                g_vanillaNPCStates[targetNPC->GetFormID()] = vanillaStr;
-            }
-
-            FILE* fp = nullptr;
-            fopen_s(&fp, entry.path().string().c_str(), "rb");
-            if (fp) {
-                try {
-                    char readBuffer[65536];
-                    rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
-                    rapidjson::Document doc;
-                    doc.ParseStream(is);
-                    fclose(fp);
-
-                    if (doc.IsObject()) {
-                        std::string nifPath = "";
-
-                        // Verifica se este NPC usa um Preset linkado
-                        if (doc.HasMember("preset") && doc["preset"].IsString()) {
-                            std::string presetName = doc["preset"].GetString();
-                            logger::info("[Load] NPC {:08X} vinculado ao Preset '{}'.", targetNPC->GetFormID(), presetName);
-
-                            if (presetCache.find(presetName) != presetCache.end()) {
-                                Manager::ApplyNPCCustomizationFromJSON(targetNPC, presetCache[presetName]);
-
-                                if (presetCache[presetName].HasMember("customFaceNif") && presetCache[presetName]["customFaceNif"].IsString()) {
-                                    nifPath = presetCache[presetName]["customFaceNif"].GetString();
-                                }
-                                Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
-                                countNPCsModificados++;
-                            }
-                            else {
-                                logger::error("[Load] ABORTANDO: NPC {} aponta para preset '{}' que NAO FOI ENCONTRADO no cache.", filename, presetName);
-                            }
-                        }
-                        else {
-                            // Edição única do NPC (Não é preset)
-                            logger::info("[Load] Aplicando JSON customizado unico para NPC {:08X}.", targetNPC->GetFormID());
-                            Manager::ApplyNPCCustomizationFromJSON(targetNPC, doc);
-                            if (doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString()) {
-                                nifPath = doc["customFaceNif"].GetString();
-                            }
-                            Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
-                            countNPCsModificados++;
-                        }
-                    }
-                    else {
-                        logger::error("[Load] O JSON do NPC '{}' nao e um objeto valido.", filename);
-                    }
-                }
-                catch (...) {
-                    if (fp) fclose(fp);
-                    logger::error("[Load] Excecao ao ler/aplicar o arquivo de NPC: {}", filename);
-                }
-            }
-            else {
-                logger::error("[Load] Falha ao abrir arquivo JSON do NPC: {}", filename);
-            }
-        }
-    }
-
-    logger::info("[Load] Escaneando FaceGeoms dinâmicos...");
+    logger::debug("[Load] Escaneando FaceGeoms dinamicos...");
     ScanFaceGeom();
 
     logger::info("[NPC Replacer] BOOT CONCLUIDO: {} presets em cache, {} NPCs modificados com sucesso.", countPresetsCarregados, countNPCsModificados);

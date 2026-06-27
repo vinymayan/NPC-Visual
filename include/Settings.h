@@ -17,7 +17,9 @@ namespace NSettings {
     void NPCMenu();
     void Presets();
     void NPCList();
+    void Export();
     void MmRegister();
     void Load();
     void Save();
+	void Debug();
 }

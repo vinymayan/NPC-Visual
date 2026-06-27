@@ -1,0 +1,11 @@
+{
+    "menu.editor": "Editor",
+    "menu.presets": "Presets",
+    "menu.database": "Database",
+    "menu.export": "Export",
+    "export.title": "Export Package",
+    "export.description": "Select presets and NPC edits to export into one ZIP package.",
+    "export.refresh": "Refresh Lists",
+    "export.export_selected": "Export Selected",
+    "export.output_hint": "ZIP files are saved to Data/Viny Mods/NPC Visual/Export."
+}
