@@ -218,11 +218,11 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Do
 
         // 1. Atributos B?sicos
         logger::debug("[ApplyJSON] [{:08X}] Passo 1: Aplicando atributos basicos...", npc->GetFormID());
-        if (doc.HasMember("height") && doc["height"].IsFloat()) {
+        if (doc.HasMember("height") && doc["height"].IsNumber()) {
             npc->height = doc["height"].GetFloat();
         }
 
-        if (doc.HasMember("weight") && doc["weight"].IsFloat()) {
+        if (doc.HasMember("weight") && doc["weight"].IsNumber()) {
             npc->weight = doc["weight"].GetFloat();
         }
 
@@ -288,14 +288,22 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Do
             else npc->sleepOutfit = nullptr;
         }
 
-        /*if (doc.HasMember("voice")) {
+        if (doc.HasMember("voice")) {
+            const auto voiceRef = FormUtil::FormRefDebugString(doc["voice"]);
             if (auto voice = FormUtil::ResolveForm<RE::BGSVoiceType>(doc["voice"])) {
-                npc->SetObjectVoiceType(voice);
+                npc->voiceType = voice;
+                logger::debug("[ApplyJSON] [{:08X}] Voice aplicada via voiceType: '{}' ptr={:X}",
+                    npc->GetFormID(),
+                    voiceRef,
+                    reinterpret_cast<std::uintptr_t>(voice));
             }
             else {
-                npc->SetObjectVoiceType(nullptr); 
+                npc->voiceType = nullptr;
+                logger::debug("[ApplyJSON] [{:08X}] Voice limpa: '{}' nao resolveu BGSVoiceType.",
+                    npc->GetFormID(),
+                    voiceRef);
             }
-        }*/
+        }
 
         if (doc.HasMember("hairColor")) {
             if (auto hc = FormUtil::ResolveForm<RE::BGSColorForm>(doc["hairColor"])) {
@@ -306,12 +314,13 @@ void Manager::ApplyNPCCustomizationFromJSON(RE::TESNPC* npc, const rapidjson::Do
                 npc->headRelatedData->hairColor = hc;
             }
         }
-        logger::debug("[ApplyJSON] [{:08X}] Passo 2 OK: race={:X} skin={:X} outfit={:X} sleepOutfit={:X} hairColor={:X}",
+        logger::debug("[ApplyJSON] [{:08X}] Passo 2 OK: race={:X} skin={:X} outfit={:X} sleepOutfit={:X} voice={:X} hairColor={:X}",
             npc->GetFormID(),
             reinterpret_cast<std::uintptr_t>(npc->race),
             reinterpret_cast<std::uintptr_t>(npc->farSkin),
             reinterpret_cast<std::uintptr_t>(npc->defaultOutfit),
             reinterpret_cast<std::uintptr_t>(npc->sleepOutfit),
+            reinterpret_cast<std::uintptr_t>(npc->voiceType),
             npc->headRelatedData ? reinterpret_cast<std::uintptr_t>(npc->headRelatedData->hairColor) : 0);
 
         // 3. HeadParts

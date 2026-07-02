@@ -19,23 +19,53 @@ static std::map<std::string, std::string> g_loc;
 
 static void WriteDefaultLanguageFile()
 {
+    rapidjson::Document doc;
+    doc.SetObject();
+
     if (std::filesystem::exists(LanguagePath)) {
-        return;
+        FILE* readFp = nullptr;
+        fopen_s(&readFp, LanguagePath, "rb");
+        if (readFp) {
+            char readBuffer[65536];
+            rapidjson::FileReadStream is(readFp, readBuffer, sizeof(readBuffer));
+            doc.ParseStream(is);
+            fclose(readFp);
+
+            if (doc.HasParseError() || !doc.IsObject()) {
+                logger::warn("[Language] Existing Language.json is invalid; rebuilding defaults.");
+                doc.SetObject();
+            }
+        }
     }
 
     std::filesystem::create_directories(BasePath);
-    rapidjson::Document doc;
     auto& allocator = doc.GetAllocator();
-    doc.SetObject();
-    doc.AddMember("menu.editor", "Editor", allocator);
-    doc.AddMember("menu.presets", "Presets", allocator);
-    doc.AddMember("menu.database", "Database", allocator);
-    doc.AddMember("menu.export", "Export", allocator);
-    doc.AddMember("export.title", "Export Package", allocator);
-    doc.AddMember("export.description", "Select presets and NPC edits to export into one ZIP package.", allocator);
-    doc.AddMember("export.refresh", "Refresh Lists", allocator);
-    doc.AddMember("export.export_selected", "Export Selected", allocator);
-    doc.AddMember("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export.", allocator);
+
+    auto ensureString = [&](const char* key, const char* value) {
+        if (doc.HasMember(key)) {
+            return;
+        }
+
+        rapidjson::Value name;
+        name.SetString(key, allocator);
+        rapidjson::Value text;
+        text.SetString(value, allocator);
+        doc.AddMember(name, text, allocator);
+    };
+
+    ensureString("menu.editor", "Editor");
+    ensureString("menu.presets", "Presets");
+    ensureString("menu.database", "Database");
+    ensureString("menu.export", "Export");
+    ensureString("menu.debug", "Debug");
+    ensureString("export.title", "Export Package");
+    ensureString("export.description", "Select presets and NPC edits to export into one ZIP package.");
+    ensureString("export.refresh", "Refresh Lists");
+    ensureString("export.export_selected", "Export Selected");
+    ensureString("export.output_hint", "ZIP files are saved to Data/Viny Mods/NPC Visual/Export.");
+    ensureString("debug.title", "Debug Tools");
+    ensureString("debug.reload_data", "Reload Data");
+    ensureString("debug.reload_data_hint", "Refreshes the internal form database. Use this after dynamic form mods have injected or updated forms.");
 
     FILE* fp = nullptr;
     fopen_s(&fp, LanguagePath, "wb");
@@ -172,12 +202,118 @@ static void RemoveJsonInBothLocations(const std::string& folder, const std::stri
     std::filesystem::remove(std::filesystem::path(legacyFolder) / (name + ".json"), ec);
 }
 
+static std::string NormalizeFsPathForCompare(std::filesystem::path path)
+{
+    auto value = path.lexically_normal().string();
+    std::replace(value.begin(), value.end(), '/', '\\');
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+static bool PathStartsWith(const std::filesystem::path& path, const std::filesystem::path& root)
+{
+    auto value = NormalizeFsPathForCompare(path);
+    auto prefix = NormalizeFsPathForCompare(root);
+    return value.rfind(prefix, 0) == 0;
+}
+
+static const char* JsonKind(const rapidjson::Value& value)
+{
+    if (value.IsObject()) return "object";
+    if (value.IsArray()) return "array";
+    if (value.IsString()) return "string";
+    if (value.IsBool()) return "bool";
+    if (value.IsNumber()) return "number";
+    if (value.IsNull()) return "null";
+    return "unknown";
+}
+
+static void LogJsonCompatibilityShape(const std::filesystem::path& path, const rapidjson::Document& doc, const char* context)
+{
+    std::uint32_t oldStringRefs = 0;
+    std::uint32_t newObjectRefs = 0;
+    std::uint32_t numericRefs = 0;
+    std::uint32_t emptyStringRefs = 0;
+    std::uint32_t invalidRefs = 0;
+
+    auto classifyRef = [&](const rapidjson::Value& value) {
+        if (value.IsObject()) {
+            ++newObjectRefs;
+        }
+        else if (value.IsString()) {
+            if (value.GetStringLength() == 0) {
+                ++emptyStringRefs;
+            }
+            else {
+                ++oldStringRefs;
+            }
+        }
+        else if (value.IsUint()) {
+            ++numericRefs;
+        }
+        else {
+            ++invalidRefs;
+        }
+    };
+
+    const char* formKeys[] = { "race", "skin", "defaultOutfit", "sleepOutfit", "voice", "hairColor" };
+    for (const auto* key : formKeys) {
+        if (doc.HasMember(key)) {
+            classifyRef(doc[key]);
+            logger::debug("[JSONCompat] context={} key='{}' kind={} path='{}'",
+                context,
+                key,
+                JsonKind(doc[key]),
+                path.string());
+        }
+    }
+
+    std::uint32_t headPartCount = 0;
+    if (doc.HasMember("headParts") && doc["headParts"].IsArray()) {
+        for (const auto& hp : doc["headParts"].GetArray()) {
+            ++headPartCount;
+            classifyRef(hp);
+        }
+    }
+    else if (doc.HasMember("headParts")) {
+        ++invalidRefs;
+        logger::debug("[JSONCompat] context={} key='headParts' kind={} expected=array path='{}'",
+            context,
+            JsonKind(doc["headParts"]),
+            path.string());
+    }
+
+    logger::debug("[JSONCompat] context={} path='{}' legacyLocation={} presetLink={} customFaceNif={} headParts={} oldStringRefs={} newObjectRefs={} numericRefs={} emptyStringRefs={} invalidRefs={}",
+        context,
+        path.string(),
+        PathStartsWith(path, LegacyBasePath),
+        doc.HasMember("preset") && doc["preset"].IsString(),
+        doc.HasMember("customFaceNif") && doc["customFaceNif"].IsString(),
+        headPartCount,
+        oldStringRefs,
+        newObjectRefs,
+        numericRefs,
+        emptyStringRefs,
+        invalidRefs);
+}
+
 static bool ReadJsonObjectFromFile(const std::filesystem::path& path, rapidjson::Document& outDoc, const char* context)
 {
     outDoc.SetObject();
 
     FILE* fp = nullptr;
     const auto pathStr = path.string();
+    std::error_code fileEc;
+    const auto fileSize = std::filesystem::exists(path, fileEc) && !fileEc ? std::filesystem::file_size(path, fileEc) : 0;
+    logger::debug("[{}] ReadJsonObject BEGIN path='{}' exists={} size={} legacyLocation={}",
+        context,
+        pathStr,
+        std::filesystem::exists(path),
+        fileEc ? 0 : fileSize,
+        PathStartsWith(path, LegacyBasePath));
+
     fopen_s(&fp, pathStr.c_str(), "rb");
     if (!fp) {
         logger::warn("[{}] Falha ao abrir JSON: {}", context, pathStr);
@@ -212,6 +348,9 @@ static bool ReadJsonObjectFromFile(const std::filesystem::path& path, rapidjson:
         logger::error("[{}] JSON nao e objeto: {}", context, pathStr);
         return false;
     }
+
+    LogJsonCompatibilityShape(path, outDoc, context);
+    logger::debug("[{}] ReadJsonObject END path='{}' members={}", context, pathStr, outDoc.MemberCount());
 
     return true;
 }
@@ -375,7 +514,7 @@ void CaptureVanillaState(RE::TESNPC* npc, std::string& outJson) {
     if (npc->farSkin) doc.AddMember("skin", FormUtil::MakeFormRef(npc->farSkin, allocator), allocator);
     if (npc->defaultOutfit) doc.AddMember("defaultOutfit", FormUtil::MakeFormRef(npc->defaultOutfit, allocator), allocator);
     if (npc->sleepOutfit) doc.AddMember("sleepOutfit", FormUtil::MakeFormRef(npc->sleepOutfit, allocator), allocator);
-    if (npc->GetObjectVoiceType()) doc.AddMember("voice", FormUtil::MakeFormRef(npc->GetObjectVoiceType(), allocator), allocator);
+    if (npc->voiceType) doc.AddMember("voice", FormUtil::MakeFormRef(npc->voiceType, allocator), allocator);
     if (npc->headRelatedData && npc->headRelatedData->hairColor) doc.AddMember("hairColor", FormUtil::MakeFormRef(npc->headRelatedData->hairColor, allocator), allocator);
 
     rapidjson::Value hpArray(rapidjson::kArrayType);
@@ -491,7 +630,12 @@ void EnsureMenuListsPopulated()
 {
     auto* manager = Manager::GetSingleton();
     if (!manager->_isPopulated) {
+        logger::debug("[MenuPopulate] PopulateAllLists BEGIN reason=menu_open");
         manager->PopulateAllLists();
+        logger::debug("[MenuPopulate] PopulateAllLists END reason=menu_open");
+    }
+    else {
+        logger::debug("[MenuPopulate] PopulateAllLists SKIP alreadyPopulated=true reason=menu_open");
     }
 }
 
@@ -905,8 +1049,8 @@ void GenerateJSONFromUI(rapidjson::Document& doc) {
     else doc.AddMember("defaultOutfit", "", allocator);
     if (ui_sleepOutfit) doc.AddMember("sleepOutfit", FormUtil::MakeFormRef(ui_sleepOutfit, allocator), allocator);
     else doc.AddMember("sleepOutfit", "", allocator);
-    /*if (ui_voice) doc.AddMember("voice", FormUtil::MakeFormRef(ui_voice, allocator), allocator);
-    else doc.AddMember("voice", "", allocator); */
+    if (ui_voice) doc.AddMember("voice", FormUtil::MakeFormRef(ui_voice, allocator), allocator);
+    else doc.AddMember("voice", "", allocator);
     if (ui_hairColor) doc.AddMember("hairColor", FormUtil::MakeFormRef(ui_hairColor, allocator), allocator);
     if (!ui_customFaceNif.empty()) {
         doc.AddMember("customFaceNif", rapidjson::Value(ui_customFaceNif.c_str(), allocator), allocator);
@@ -1004,17 +1148,17 @@ void ParseJSONToUI(const rapidjson::Document& j) {
         ui_bodyColor[3] = getInt(c, "a", 0) / 255.0f;
     }
 
-    if (j.HasMember("race") && j["race"].IsString()) ui_race = FormUtil::ResolveForm<RE::TESRace>(j["race"]);
-    if (j.HasMember("skin") && j["skin"].IsString()) ui_skin = FormUtil::ResolveForm<RE::TESObjectARMO>(j["skin"]);
-    if (j.HasMember("defaultOutfit") && j["defaultOutfit"].IsString()) ui_outfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["defaultOutfit"]);
-    if (j.HasMember("sleepOutfit") && j["sleepOutfit"].IsString()) ui_sleepOutfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["sleepOutfit"]);
-    if (j.HasMember("voice") && j["voice"].IsString()) ui_voice = FormUtil::ResolveForm<RE::BGSVoiceType>(j["voice"]);
-    if (j.HasMember("hairColor") && j["hairColor"].IsString()) ui_hairColor = FormUtil::ResolveForm<RE::BGSColorForm>(j["hairColor"]);
+    if (j.HasMember("race")) ui_race = FormUtil::ResolveForm<RE::TESRace>(j["race"]);
+    if (j.HasMember("skin")) ui_skin = FormUtil::ResolveForm<RE::TESObjectARMO>(j["skin"]);
+    if (j.HasMember("defaultOutfit")) ui_outfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["defaultOutfit"]);
+    if (j.HasMember("sleepOutfit")) ui_sleepOutfit = FormUtil::ResolveForm<RE::BGSOutfit>(j["sleepOutfit"]);
+    if (j.HasMember("voice")) ui_voice = FormUtil::ResolveForm<RE::BGSVoiceType>(j["voice"]);
+    if (j.HasMember("hairColor")) ui_hairColor = FormUtil::ResolveForm<RE::BGSColorForm>(j["hairColor"]);
 
     ui_headParts.clear();
     if (j.HasMember("headParts") && j["headParts"].IsArray()) {
         for (const auto& hpJson : j["headParts"].GetArray()) {
-            if (!hpJson.IsString()) {
+            if (!hpJson.IsString() && !hpJson.IsObject() && !hpJson.IsUint()) {
                 continue;
             }
             if (auto hp = FormUtil::ResolveForm<RE::BGSHeadPart>(hpJson)) {
@@ -1184,26 +1328,57 @@ void LoadPresetToUI(const std::string& presetName) {
 }
 
 void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr) {
+    logger::debug("[UI EditNPC] LoadNPCToUI BEGIN npcToLoad={:X} actorRef={:X}",
+        reinterpret_cast<std::uintptr_t>(npcToLoad),
+        reinterpret_cast<std::uintptr_t>(actorRef));
+
     if (!npcToLoad) {
+        logger::debug("[UI EditNPC] Resolving NPC from console selected ref BEGIN");
         auto ref = RE::Console::GetSelectedRef();
         if (!ref) { logger::warn("No NPC selected."); return; }
         g_currentActor = ref->As<RE::Actor>();
-        if (!g_currentActor) return;
+        if (!g_currentActor) {
+            logger::debug("[UI EditNPC] Console selected ref is not an actor ptr={:X}", reinterpret_cast<std::uintptr_t>(ref.get()));
+            return;
+        }
         g_currentNPC = g_currentActor->GetActorBase();
+        logger::debug("[UI EditNPC] Resolving NPC from console selected ref END actor={:08X}",
+            g_currentActor ? g_currentActor->GetFormID() : 0);
     }
     else {
         g_currentNPC = npcToLoad;
         g_currentActor = actorRef;
     }
 
-    if (!g_currentNPC) return;
+    if (!g_currentNPC) {
+        logger::debug("[UI EditNPC] ABORT: g_currentNPC is null");
+        return;
+    }
 
+    const auto npcEditorID = clib_util::editorID::get_editorID(g_currentNPC);
+    logger::debug("[UI EditNPC] NPC resolved form={:08X} editorID='{}' name='{}' npcPtr={:X} actorPtr={:X} headParts={} tintLayersPtr={:X} faceData={:X}",
+        g_currentNPC->GetFormID(),
+        npcEditorID,
+        g_currentNPC->GetFullName() ? g_currentNPC->GetFullName() : "",
+        reinterpret_cast<std::uintptr_t>(g_currentNPC),
+        reinterpret_cast<std::uintptr_t>(g_currentActor),
+        static_cast<std::uint32_t>(g_currentNPC->numHeadParts),
+        reinterpret_cast<std::uintptr_t>(g_currentNPC->tintLayers),
+        reinterpret_cast<std::uintptr_t>(g_currentNPC->faceData));
+
+    logger::debug("[UI EditNPC] DumpFaceDiagnostics BEGIN npc={:08X}", g_currentNPC->GetFormID());
     Manager::DumpFaceDiagnostics(g_currentActor, g_currentNPC, "UI LoadNPCToUI");
+    logger::debug("[UI EditNPC] DumpFaceDiagnostics END npc={:08X}", g_currentNPC->GetFormID());
 
     if (!g_vanillaNPCStates.contains(g_currentNPC->GetFormID())) {
+        logger::debug("[UI EditNPC] CaptureVanillaState BEGIN npc={:08X}", g_currentNPC->GetFormID());
         std::string vanillaStr;
         CaptureVanillaState(g_currentNPC, vanillaStr);
         g_vanillaNPCStates[g_currentNPC->GetFormID()] = vanillaStr;
+        logger::debug("[UI EditNPC] CaptureVanillaState END npc={:08X} bytes={}", g_currentNPC->GetFormID(), vanillaStr.size());
+    }
+    else {
+        logger::debug("[UI EditNPC] CaptureVanillaState SKIP cached npc={:08X}", g_currentNPC->GetFormID());
     }
 
     isEditingPreset = false;
@@ -1225,7 +1400,7 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     ui_skin = g_currentNPC->farSkin;
     ui_outfit = g_currentNPC->defaultOutfit;
     ui_sleepOutfit = g_currentNPC->sleepOutfit;
-    ui_voice = g_currentNPC->GetObjectVoiceType();
+    ui_voice = g_currentNPC->voiceType;
     ui_hairColor = g_currentNPC->headRelatedData ? g_currentNPC->headRelatedData->hairColor : nullptr;
 
     ui_headParts.clear();
@@ -1284,8 +1459,14 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     std::string editorID = clib_util::editorID::get_editorID(g_currentNPC);
     if (editorID.empty()) editorID = std::format("{:08X}", g_currentNPC->GetFormID());
     std::string filePath = ResolveJsonPath(NPCPath, LegacyNPCPath, editorID).string();
+    logger::debug("[UI EditNPC] Checking saved NPC JSON npc={:08X} editorID='{}' path='{}' exists={}",
+        g_currentNPC->GetFormID(),
+        editorID,
+        filePath,
+        std::filesystem::exists(filePath));
 
     if (std::filesystem::exists(filePath)) {
+        logger::debug("[UI EditNPC] Read saved NPC JSON BEGIN path='{}'", filePath);
         FILE* fp = nullptr;
         fopen_s(&fp, filePath.c_str(), "rb");
         if (fp) {
@@ -1294,17 +1475,31 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
             rapidjson::Document doc;
             doc.ParseStream(is);
             fclose(fp);
+            logger::debug("[UI EditNPC] Read saved NPC JSON END path='{}' isObject={} parseError={}",
+                filePath,
+                doc.IsObject(),
+                doc.HasParseError());
             if (doc.IsObject() && doc.HasMember("preset") && doc["preset"].IsString()) {
                 ui_linkedPreset = doc["preset"].GetString();
                 std::string presetPath = ResolveJsonPath(PresetsPath, LegacyPresetsPath, ui_linkedPreset).string();
+                logger::debug("[UI EditNPC] Linked preset detected npc={:08X} preset='{}' path='{}' exists={}",
+                    g_currentNPC->GetFormID(),
+                    ui_linkedPreset,
+                    presetPath,
+                    std::filesystem::exists(presetPath));
                 FILE* presetFp = nullptr;
                 fopen_s(&presetFp, presetPath.c_str(), "rb");
                 if (presetFp) {
+                    logger::debug("[UI EditNPC] Read linked preset JSON BEGIN path='{}'", presetPath);
                     char presetReadBuffer[65536];
                     rapidjson::FileReadStream presetStream(presetFp, presetReadBuffer, sizeof(presetReadBuffer));
                     rapidjson::Document presetDoc;
                     presetDoc.ParseStream(presetStream);
                     fclose(presetFp);
+                    logger::debug("[UI EditNPC] Read linked preset JSON END path='{}' isObject={} parseError={}",
+                        presetPath,
+                        presetDoc.IsObject(),
+                        presetDoc.HasParseError());
                     if (presetDoc.IsObject() && presetDoc.HasMember("customFaceNif") && presetDoc["customFaceNif"].IsString()) {
                         ui_customFaceNif = presetDoc["customFaceNif"].GetString();
                     }
@@ -1314,13 +1509,20 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
                 ui_customFaceNif = doc["customFaceNif"].GetString();
             }
         }
+        else {
+            logger::debug("[UI EditNPC] Failed to open saved NPC JSON path='{}'", filePath);
+        }
     }
 
     if (ui_customFaceNif.empty()) {
         if (needFaceScan) {
+            logger::debug("[UI EditNPC] ScanFaceGeom BEGIN while resolving default face npc={:08X}", g_currentNPC->GetFormID());
             ScanFaceGeom();
+            logger::debug("[UI EditNPC] ScanFaceGeom END while resolving default face npc={:08X}", g_currentNPC->GetFormID());
         }
+        logger::debug("[UI EditNPC] ResolveDefaultFaceGeomPath BEGIN npc={:08X}", g_currentNPC->GetFormID());
         ui_customFaceNif = ResolveDefaultFaceGeomPath(g_currentNPC);
+        logger::debug("[UI EditNPC] ResolveDefaultFaceGeomPath END npc={:08X} nif='{}'", g_currentNPC->GetFormID(), ui_customFaceNif);
         if (!ui_customFaceNif.empty()) {
             logger::debug("[UI LoadNPCToUI] FaceGeom padrao resolvida para NPC {:08X}: '{}'",
                 g_currentNPC->GetFormID(),
@@ -1329,6 +1531,12 @@ void LoadNPCToUI(RE::TESNPC* npcToLoad = nullptr, RE::Actor* actorRef = nullptr)
     }
 
     UpdateLastSavedState(); // Atualiza a "fotografia" do estado guardado
+    logger::debug("[UI EditNPC] LoadNPCToUI END npc={:08X} linkedPreset='{}' customFaceNif='{}' headParts={} tintLayers={}",
+        g_currentNPC->GetFormID(),
+        ui_linkedPreset,
+        ui_customFaceNif,
+        ui_headParts.size(),
+        ui_tintLayers.size());
 }
 
 void SaveData() {
@@ -2060,7 +2268,7 @@ void DrawMainEditorUI() {
 
     static int s_raceIdx = 0, s_skinIdx = 0, s_outfitIdx = 0, s_sleepOutfitIdx = 0, s_hairColorIdx = 0, s_voiceIdx = 0;
     DrawDropdown("Race", "Race", &ui_race, s_raceIdx, isLocked);
-    //DrawDropdown("Voice Type", "Voice", &ui_voice, s_voiceIdx, isLocked);
+    DrawDropdown("Voice Type", "Voice", &ui_voice, s_voiceIdx, isLocked);
     DrawDropdown("Worn Skin", "Armor", &ui_skin, s_skinIdx, isLocked);
     DrawDropdown("Default Outfit", "Outfit", &ui_outfit, s_outfitIdx, isLocked);
     DrawDropdown("Sleep Outfit", "Outfit", &ui_sleepOutfit, s_sleepOutfitIdx, isLocked);
@@ -3048,11 +3256,24 @@ void NSettings::Export() {
 
 void NSettings::Debug()
 {
-    if (ImGuiMCP::Button("Update lists")) {
-        auto* manager = Manager::GetSingleton();
+    auto* manager = Manager::GetSingleton();
+
+    ImGuiMCP::Text("%s", GetLoc("debug.title", "Debug Tools"));
+    ImGuiMCP::Separator();
+    ImGuiMCP::TextWrapped("%s", GetLoc("debug.reload_data_hint", "Refreshes the internal form database. Use this after dynamic form mods have injected or updated forms."));
+    ImGuiMCP::Text("Form database populated: %s", manager && manager->_isPopulated ? "yes" : "no");
+    ImGuiMCP::Separator();
+
+    if (ImGuiMCP::Button(GetLoc("debug.reload_data", "Reload Data"))) {
         if (manager) {
+            logger::debug("[DebugMenu] Reload Data clicked: forcing PopulateAllLists after dynamic form update.");
             manager->_isPopulated = false;
-            manager->PopulateAllLists();
+            logger::debug("[DebugMenu] PopulateAllLists BEGIN reason=manual_reload_data");
+            manager->PopulateAllLists(true);
+            logger::debug("[DebugMenu] PopulateAllLists END reason=manual_reload_data");
+        }
+        else {
+            logger::debug("[DebugMenu] Reload Data clicked but manager is null.");
         }
     }
 }
@@ -3060,24 +3281,45 @@ void NSettings::Debug()
 
 
 void NSettings::MmRegister() {
+    logger::debug("[MainMenuBoot] MmRegister entered SKSEMenuFrameworkInstalled={}", SKSEMenuFramework::IsInstalled());
     if (SKSEMenuFramework::IsInstalled()) {
+        logger::debug("[MainMenuBoot] EnsureStorageDirectories BEGIN");
         EnsureStorageDirectories();
+        logger::debug("[MainMenuBoot] EnsureStorageDirectories END");
+        logger::debug("[MainMenuBoot] LoadLanguage BEGIN");
         LoadLanguage();
+        logger::debug("[MainMenuBoot] LoadLanguage END");
+        logger::debug("[MainMenuBoot] SetSection BEGIN");
         SKSEMenuFramework::SetSection("NPC Visual Editor");
+        logger::debug("[MainMenuBoot] SetSection END");
+        logger::debug("[MainMenuBoot] AddSectionItem Editor BEGIN");
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.editor", "Editor"), NPCMenu);
+        logger::debug("[MainMenuBoot] AddSectionItem Editor END");
+        logger::debug("[MainMenuBoot] AddSectionItem Presets BEGIN");
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.presets", "Presets"), Presets);
+        logger::debug("[MainMenuBoot] AddSectionItem Presets END");
+        logger::debug("[MainMenuBoot] AddSectionItem Database BEGIN");
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.database", "Database"), NPCList);
+        logger::debug("[MainMenuBoot] AddSectionItem Database END");
+        logger::debug("[MainMenuBoot] AddSectionItem Export BEGIN");
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.export", "Export"), Export);
-        SKSEMenuFramework::AddSectionItem("Debug", Debug);
+        logger::debug("[MainMenuBoot] AddSectionItem Export END");
+        logger::debug("[MainMenuBoot] AddSectionItem Debug BEGIN");
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.debug", "Debug"), Debug);
+        logger::debug("[MainMenuBoot] AddSectionItem Debug END");
         logger::debug("[MmRegister] Menu sections registered successfully.");
     }
+    logger::debug("[MainMenuBoot] MmRegister exit");
 }
 
 void NSettings::Load() {
-    logger::debug("[Load] Inicializando sistema de arquivos...");
+    logger::debug("[LoadSavedData] BEGIN");
+    logger::debug("[LoadSavedData] Inicializando sistema de arquivos...");
     EnsureStorageDirectories();
     LoadLanguage();
+    logger::debug("[LoadSavedData] ClearAffectedNPCs BEGIN");
     Manager::GetSingleton()->ClearAffectedNPCs();
+    logger::debug("[LoadSavedData] ClearAffectedNPCs END");
     refreshListsOnNextMenuOpen = true;
 
     int countPresetsCarregados = 0;
@@ -3085,60 +3327,94 @@ void NSettings::Load() {
 
     std::map<std::string, rapidjson::Document> presetCache;
 
-    logger::debug("[Load] Passo 1: Lendo arquivos na pasta de Presets...");
-    for (const auto& presetJson : CollectJsonFiles(PresetsPath, LegacyPresetsPath)) {
+    const auto presetFiles = CollectJsonFiles(PresetsPath, LegacyPresetsPath);
+    const auto npcFiles = CollectJsonFiles(NPCPath, LegacyNPCPath);
+
+    logger::debug("[LoadSavedData] Found preset JSONs count={} primary='{}' legacy='{}'",
+        presetFiles.size(),
+        PresetsPath,
+        LegacyPresetsPath);
+    logger::debug("[LoadSavedData] Found NPC JSONs count={} primary='{}' legacy='{}'",
+        npcFiles.size(),
+        NPCPath,
+        LegacyNPCPath);
+
+    logger::debug("[LoadSavedData] Passo 1: Lendo arquivos na pasta de Presets...");
+    for (const auto& presetJson : presetFiles) {
         std::filesystem::directory_entry entry(presetJson);
         if (entry.path().extension() != ".json") {
             continue;
         }
 
         std::string presetName = entry.path().stem().string();
+        std::error_code fileEc;
+        const auto fileSize = std::filesystem::file_size(entry.path(), fileEc);
+        logger::debug("[LoadSavedData] Preset JSON begin name='{}' path='{}' size={} legacy={}",
+            presetName,
+            entry.path().string(),
+            fileEc ? 0 : fileSize,
+            entry.path().string().find(LegacyPresetsPath) == 0);
+
         rapidjson::Document doc;
         if (!ReadJsonObjectFromFile(entry.path(), doc, "Load/Preset")) {
-            logger::warn("[Load] Preset ignorado por JSON invalido: {}", presetName);
+            logger::warn("[LoadSavedData] Preset ignorado por JSON invalido: {}", presetName);
             continue;
         }
 
         presetCache[presetName] = std::move(doc);
         countPresetsCarregados++;
-        logger::debug("[Load] Preset cacheado com sucesso: {}", presetName);
+        logger::debug("[LoadSavedData] Preset cacheado com sucesso: {}", presetName);
     }
 
-    logger::debug("[Load] Passo 2: Lendo arquivos na pasta de NPCs...");
-    for (const auto& npcJson : CollectJsonFiles(NPCPath, LegacyNPCPath)) {
+    logger::debug("[LoadSavedData] Passo 2: Lendo arquivos na pasta de NPCs...");
+    for (const auto& npcJson : npcFiles) {
         std::filesystem::directory_entry entry(npcJson);
         if (entry.path().extension() != ".json") {
             continue;
         }
 
         std::string filename = entry.path().stem().string();
-        logger::debug("[Load] Processando arquivo de NPC: {}.json", filename);
+        std::error_code fileEc;
+        const auto fileSize = std::filesystem::file_size(entry.path(), fileEc);
+        logger::debug("[LoadSavedData] NPC JSON begin file='{}' path='{}' size={} legacy={}",
+            filename,
+            entry.path().string(),
+            fileEc ? 0 : fileSize,
+            entry.path().string().find(LegacyNPCPath) == 0);
 
         RE::TESNPC* targetNPC = nullptr;
+        const char* resolveMode = "none";
 
         if (auto edidForm = RE::TESForm::LookupByEditorID(filename)) {
             targetNPC = edidForm->As<RE::TESNPC>();
+            resolveMode = targetNPC ? "editorID" : "editorID-wrong-type";
         }
         else {
             try {
                 RE::FormID id = std::stoul(filename, nullptr, 16);
-                if (auto idForm = RE::TESForm::LookupByID(id)) targetNPC = idForm->As<RE::TESNPC>();
+                if (auto idForm = RE::TESForm::LookupByID(id)) {
+                    targetNPC = idForm->As<RE::TESNPC>();
+                    resolveMode = targetNPC ? "formID" : "formID-wrong-type";
+                }
             }
             catch (...) {
-                logger::warn("[Load] Arquivo '{}' tem nome invalido (Nao eh EditorID nem Hex FormID).", filename);
+                logger::warn("[LoadSavedData] Arquivo '{}' tem nome invalido (Nao eh EditorID nem Hex FormID).", filename);
             }
         }
 
         if (!targetNPC) {
-            logger::error("[Load] Falha! NPC base '{}' nao encontrado na memoria do jogo.", filename);
+            logger::error("[LoadSavedData] Falha! NPC base '{}' nao encontrado na memoria do jogo resolveMode={}.", filename, resolveMode);
             continue;
         }
 
-        logger::debug("[Load] NPC '{}' resolvido para FormID {:08X}. Lendo JSON...", filename, targetNPC->GetFormID());
+        logger::debug("[LoadSavedData] NPC '{}' resolvido para FormID {:08X} mode={}. Lendo JSON...",
+            filename,
+            targetNPC->GetFormID(),
+            resolveMode);
 
         rapidjson::Document doc;
         if (!ReadJsonObjectFromFile(entry.path(), doc, "Load/NPC")) {
-            logger::warn("[Load] NPC '{}' ignorado por JSON invalido.", filename);
+            logger::warn("[LoadSavedData] NPC '{}' ignorado por JSON invalido.", filename);
             continue;
         }
 
@@ -3147,62 +3423,68 @@ void NSettings::Load() {
         // Verifica se este NPC usa um Preset linkado.
         if (doc.HasMember("preset") && doc["preset"].IsString()) {
             std::string presetName = doc["preset"].GetString();
-            logger::debug("[Load] NPC {:08X} vinculado ao Preset '{}'.", targetNPC->GetFormID(), presetName);
+            logger::debug("[LoadSavedData] NPC {:08X} vinculado ao Preset '{}'.", targetNPC->GetFormID(), presetName);
 
             auto presetIt = presetCache.find(presetName);
             if (presetIt != presetCache.end()) {
+                logger::debug("[LoadSavedData] BuildSafeCustomizationDocument preset BEGIN preset='{}' npc={:08X}", presetName, targetNPC->GetFormID());
                 rapidjson::Document safePresetDoc = BuildSafeCustomizationDocument(targetNPC, presetIt->second);
+                logger::debug("[LoadSavedData] BuildSafeCustomizationDocument preset END preset='{}' npc={:08X}", presetName, targetNPC->GetFormID());
 
-                logger::debug("[Load] BEGIN Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
+                logger::debug("[LoadSavedData] BEGIN Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
                 Manager::ApplyNPCCustomizationFromJSON(targetNPC, safePresetDoc);
-                logger::debug("[Load] END Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
+                logger::debug("[LoadSavedData] END Apply preset '{}' em NPC {:08X}.", presetName, targetNPC->GetFormID());
 
                 if (safePresetDoc.HasMember("customFaceNif") && safePresetDoc["customFaceNif"].IsString()) {
                     nifPath = safePresetDoc["customFaceNif"].GetString();
                 }
 
                 if (!nifPath.empty()) {
-                    logger::debug("[Load] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
+                    logger::debug("[LoadSavedData] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
                     Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
-                    logger::debug("[Load] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
+                    logger::debug("[LoadSavedData] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
                 }
                 else {
                     Manager::GetSingleton()->UnregisterAffectedNPC(targetNPC->GetFormID());
-                    logger::debug("[Load] Preset sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
+                    logger::debug("[LoadSavedData] Preset sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
                 }
                 countNPCsModificados++;
             }
             else {
-                logger::error("[Load] ABORTANDO: NPC {} aponta para preset '{}' que NAO FOI ENCONTRADO no cache.", filename, presetName);
+                logger::error("[LoadSavedData] ABORTANDO: NPC {} aponta para preset '{}' que NAO FOI ENCONTRADO no cache.", filename, presetName);
             }
         }
         else {
+            logger::debug("[LoadSavedData] BuildSafeCustomizationDocument JSON unico BEGIN npc={:08X}", targetNPC->GetFormID());
             rapidjson::Document safeDoc = BuildSafeCustomizationDocument(targetNPC, doc);
+            logger::debug("[LoadSavedData] BuildSafeCustomizationDocument JSON unico END npc={:08X}", targetNPC->GetFormID());
 
-            logger::debug("[Load] Aplicando JSON customizado unico para NPC {:08X}.", targetNPC->GetFormID());
-            logger::debug("[Load] BEGIN Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
+            logger::debug("[LoadSavedData] Aplicando JSON customizado unico para NPC {:08X}.", targetNPC->GetFormID());
+            logger::debug("[LoadSavedData] BEGIN Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
             Manager::ApplyNPCCustomizationFromJSON(targetNPC, safeDoc);
-            logger::debug("[Load] END Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
+            logger::debug("[LoadSavedData] END Apply JSON unico em NPC {:08X}.", targetNPC->GetFormID());
 
             if (safeDoc.HasMember("customFaceNif") && safeDoc["customFaceNif"].IsString()) {
                 nifPath = safeDoc["customFaceNif"].GetString();
             }
 
             if (!nifPath.empty()) {
-                logger::debug("[Load] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
+                logger::debug("[LoadSavedData] RegisterAffectedNPC NPC {:08X} nif='{}'", targetNPC->GetFormID(), nifPath);
                 Manager::GetSingleton()->RegisterAffectedNPC(targetNPC->GetFormID(), nifPath);
-                logger::debug("[Load] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
+                logger::debug("[LoadSavedData] RegisterAffectedNPC OK NPC {:08X}.", targetNPC->GetFormID());
             }
             else {
                 Manager::GetSingleton()->UnregisterAffectedNPC(targetNPC->GetFormID());
-                logger::debug("[Load] JSON sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
+                logger::debug("[LoadSavedData] JSON sem customFaceNif; NPC {:08X} nao registrado como affected face.", targetNPC->GetFormID());
             }
             countNPCsModificados++;
         }
     }
 
-    logger::debug("[Load] Escaneando FaceGeoms dinamicos...");
+    logger::debug("[LoadSavedData] ScanFaceGeom BEGIN");
     ScanFaceGeom();
+    logger::debug("[LoadSavedData] ScanFaceGeom END");
 
+    logger::debug("[LoadSavedData] END presets={} npcs={}", countPresetsCarregados, countNPCsModificados);
     logger::info("[NPC Replacer] BOOT CONCLUIDO: {} presets em cache, {} NPCs modificados com sucesso.", countPresetsCarregados, countNPCsModificados);
 }
